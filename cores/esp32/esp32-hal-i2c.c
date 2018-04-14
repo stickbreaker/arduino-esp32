@@ -379,8 +379,8 @@ void i2cInitFix(i2c_t * i2c){
     while ((!i2c->dev->command[2].done) && (--count > 0));
     I2C_MUTEX_UNLOCK();
 }
-/* 
- unused 03/15/2018
+*/
+/* unused 03/15/2018
 void i2cReset(i2c_t* i2c){
     if(i2c == NULL){
         return;
@@ -1094,7 +1094,7 @@ i2c->dev->int_ena.val =
 
 if(!i2c->intr_handle){ // create ISR for either peripheral 
  // log_i("create ISR %d",i2c->num);
-  uint32_t ret;
+  uint32_t ret = ESP_FAIL;
   switch(i2c->num){
     case 0:
       ret = esp_intr_alloc(ETS_I2C_EXT0_INTR_SOURCE, 0, &i2c_isr_handler_default, i2c, &i2c->intr_handle);
