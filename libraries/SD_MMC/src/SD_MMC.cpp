@@ -42,8 +42,19 @@ bool SDMMCFS::begin(const char * mountpoint, bool mode1bit)
     }
     //mount
     sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
-    sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    // sdmmc_host_t host = SDMMC_HOST_DEFAULT();
+    // host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    sdmmc_host_t host;
+    host.flags = SDMMC_HOST_FLAG_4BIT;
+    host.slot = SDMMC_HOST_SLOT_1;
     host.max_freq_khz = SDMMC_FREQ_HIGHSPEED;
+    host.io_voltage = 3.3f;
+    host.init = &sdmmc_host_init;
+    host.set_bus_width = &sdmmc_host_set_bus_width;
+    host.set_card_clk = &sdmmc_host_set_card_clk;
+    host.do_transaction = &sdmmc_host_do_transaction;
+    host.deinit = &sdmmc_host_deinit;
+    host.command_timeout_ms = 0;
 #ifdef BOARD_HAS_1BIT_SDMMC
     mode1bit = true;
 #endif

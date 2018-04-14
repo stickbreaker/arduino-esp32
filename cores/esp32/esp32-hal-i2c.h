@@ -168,6 +168,7 @@ i2c_err_t i2cProcQueue(i2c_t *i2c, uint32_t *readCount, uint16_t timeOutMillis);
 i2c_err_t i2cAddQueueWrite(i2c_t *i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen, bool SendStop, EventGroupHandle_t event);
 i2c_err_t i2cAddQueueRead(i2c_t *i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen, bool SendStop, EventGroupHandle_t event);
 i2c_err_t i2cFreeQueue(i2c_t *i2c);
+void i2cReleaseISR(i2c_t * i2c);
 void i2cReleaseAll(i2c_t *i2c); // free ISR, Free DQ, Power off peripheral clock.  Must call i2cInit(),i2cSetFrequency() to recover
 //stickbreaker debug support
 void i2cDumpInts(uint8_t num);
