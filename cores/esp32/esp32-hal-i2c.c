@@ -1159,15 +1159,6 @@ if(!(eBits==EVENT_DONE)&&(eBits&~(EVENT_ERROR_NAK|EVENT_ERROR_DATA_NAK|EVENT_ERR
   }
 
 if(eBits&EVENT_DONE){ // no gross timeout
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_DEBUG
-  uint32_t expected =(totalBytes*10*1000)/i2cGetFrequency(i2c);
-  if((tAfter-tBefore)>(expected+1)) { //used some of the timeout Period
-    // expected can be zero due to small packets
-    log_d("used TimeoutRecovery: expected=%ums, actual=%ums, configured=%ums ",expected,(tAfter-tBefore),timeOutMillis);
-    i2cDumpI2c(i2c);
-    i2cDumpInts(i2c->num);
-    }
-#endif
   switch(i2c->error){
     case I2C_OK :
       reason = I2C_ERROR_OK;
