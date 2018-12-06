@@ -66,9 +66,19 @@ static uart_t _uart_bus_array[3] = {
 };
 #endif
 
+static void IRAM_ATTR _uart_rx_flush( uart_t * uart, BaseType_t &xHigherPriorityTaskWoken){
+	uint8_t c;
+    while(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
+        c = uart->dev->fifo.rw_byte;
+        if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+            xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+        }
+    }
+}
+
 static void IRAM_ATTR _uart_isr(void *arg)
 {
-    uint8_t i, c;
+    uint8_t i;
     BaseType_t xHigherPriorityTaskWoken;
     uart_t* uart;
 
@@ -80,12 +90,7 @@ static void IRAM_ATTR _uart_isr(void *arg)
         uart->dev->int_clr.rxfifo_full = 1;
         uart->dev->int_clr.frm_err = 1;
         uart->dev->int_clr.rxfifo_tout = 1;
-        while(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
-            c = uart->dev->fifo.rw_byte;
-            if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
-                xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
-            }
-        }
+		_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
     }
 
     if (xHigherPriorityTaskWoken) {
@@ -265,6 +270,8 @@ uint32_t uartAvailable(uart_t* uart)
     if(uart == NULL || uart->queue == NULL) {
         return 0;
     }
+	BaseType_t xHigherPriorityTaskWoken; // ignore it
+	_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
     return uxQueueMessagesWaiting(uart->queue);
 }
 
@@ -284,7 +291,13 @@ uint8_t uartRead(uart_t* uart)
     uint8_t c;
     if(xQueueReceive(uart->queue, &c, 0)) {
         return c;
-    }
+    } else {
+		BaseType_t xHigherPriorityTaskWoken; // ignore it
+		_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
+		if(xQueueReceive(uart->queue, &c, 0)) {
+			return c;
+		}
+	}
     return 0;
 }
 
@@ -296,7 +309,13 @@ uint8_t uartPeek(uart_t* uart)
     uint8_t c;
     if(xQueuePeek(uart->queue, &c, 0)) {
         return c;
-    }
+    } else {
+		BaseType_t xHigherPriorityTaskWoken; // ignore it
+		_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
+		if(xQueueReceive(uart->queue, &c, 0)) {
+			return c;
+		}
+	}
     return 0;
 }
 
