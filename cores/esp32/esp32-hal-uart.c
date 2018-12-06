@@ -66,19 +66,21 @@ static uart_t _uart_bus_array[3] = {
 };
 #endif
 
-static void IRAM_ATTR _uart_rx_flush( uart_t * uart, BaseType_t &xHigherPriorityTaskWoken){
+static void _uart_rx_flush( uart_t * uart){
 	uint8_t c;
+	UART_MUTEX_LOCK();
     while(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
         c = uart->dev->fifo.rw_byte;
-        if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
-            xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+        if(uart->queue != NULL && !xQueueIsQueueFull(uart->queue)) {
+            xQueueSend(uart->queue, &c);
         }
     }
+	UART_MUTEX_UNLOCK();
 }
 
 static void IRAM_ATTR _uart_isr(void *arg)
 {
-    uint8_t i;
+    uint8_t i,c;
     BaseType_t xHigherPriorityTaskWoken;
     uart_t* uart;
 
@@ -87,10 +89,15 @@ static void IRAM_ATTR _uart_isr(void *arg)
         if(uart->intr_handle == NULL){
             continue;
         }
+		while(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
+        	c = uart->dev->fifo.rw_byte;
+        	if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+            	xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+        	}
         uart->dev->int_clr.rxfifo_full = 1;
         uart->dev->int_clr.frm_err = 1;
         uart->dev->int_clr.rxfifo_tout = 1;
-		_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
+    	}
     }
 
     if (xHigherPriorityTaskWoken) {
@@ -101,14 +108,14 @@ static void IRAM_ATTR _uart_isr(void *arg)
 void uartEnableInterrupt(uart_t* uart)
 {
     UART_MUTEX_LOCK();
-    uart->dev->conf1.rxfifo_full_thrhd = 112;
-    uart->dev->conf1.rx_tout_thrhd = 2;
+    uart->dev->conf1.rxfifo_full_thrhd = 112; // needs speed compensation?
+    uart->dev->conf1.rx_tout_thrhd = 32; // no need to force rxFiFo empty, because uartRead() will empty if necessary
     uart->dev->conf1.rx_tout_en = 1;
     uart->dev->int_ena.rxfifo_full = 1;
     uart->dev->int_ena.frm_err = 1;
     uart->dev->int_ena.rxfifo_tout = 1;
     uart->dev->int_clr.val = 0xffffffff;
-
+// can this share an interrupt?
     esp_intr_alloc(UART_INTR_SOURCE(uart->num), (int)ESP_INTR_FLAG_IRAM, _uart_isr, NULL, &uart->intr_handle);
     UART_MUTEX_UNLOCK();
 }
@@ -270,8 +277,7 @@ uint32_t uartAvailable(uart_t* uart)
     if(uart == NULL || uart->queue == NULL) {
         return 0;
     }
-	BaseType_t xHigherPriorityTaskWoken; // ignore it
-	_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
+	_uart_rx_flush(uart);
     return uxQueueMessagesWaiting(uart->queue);
 }
 
@@ -292,8 +298,7 @@ uint8_t uartRead(uart_t* uart)
     if(xQueueReceive(uart->queue, &c, 0)) {
         return c;
     } else {
-		BaseType_t xHigherPriorityTaskWoken; // ignore it
-		_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
+		_uart_rx_flush(uart);
 		if(xQueueReceive(uart->queue, &c, 0)) {
 			return c;
 		}
@@ -310,8 +315,7 @@ uint8_t uartPeek(uart_t* uart)
     if(xQueuePeek(uart->queue, &c, 0)) {
         return c;
     } else {
-		BaseType_t xHigherPriorityTaskWoken; // ignore it
-		_uart_rx_flush(uart,&xHigherPriorityTaskWoken);
+		_uart_rx_flush(uart);
 		if(xQueueReceive(uart->queue, &c, 0)) {
 			return c;
 		}
