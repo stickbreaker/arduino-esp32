@@ -23,6 +23,7 @@
 #include "soc/i2c_reg.h"
 #include "soc/i2c_struct.h"
 #include "soc/dport_reg.h"
+#include "soc/rtc.h" // support clk speed switching
 #include "esp_attr.h"
 
 //#define I2C_DEV(i)   (volatile i2c_dev_t *)((i)?DR_REG_I2C1_EXT_BASE:DR_REG_I2C_EXT_BASE)
@@ -1611,7 +1612,9 @@ i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed)
     }
     I2C_FIFO_CONF_t f;
   
-    uint32_t period = (APB_CLK_FREQ/clk_speed) / 2;
+    // uint32_t period = (APB_CLK_FREQ/clk_speed) / 2;
+    uint32_t period = (rtc_clk_apb_freq_get()/clk_speed) / 2;
+ 
     uint32_t halfPeriod = period/2;
     uint32_t quarterPeriod = period/4;
 
