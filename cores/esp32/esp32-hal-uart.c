@@ -27,6 +27,7 @@
 #include "soc/io_mux_reg.h"
 #include "soc/gpio_sig_map.h"
 #include "soc/dport_reg.h"
+#include "soc/rtc.h"
 #include "esp_intr_alloc.h"
 
 #define UART_REG_BASE(u)    ((u==0)?DR_REG_UART_BASE:(      (u==1)?DR_REG_UART1_BASE:(    (u==2)?DR_REG_UART2_BASE:0)))
@@ -67,13 +68,15 @@ static uart_t _uart_bus_array[3] = {
 #endif
 
 static void _uart_rx_flush( uart_t * uart){
-	uint8_t c;
-	UART_MUTEX_LOCK();
-    while(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
+    uint8_t c;
+    UART_MUTEX_LOCK();
+    UBaseType_t spaces=0;
+    if(uart->queue != NULL) {
+        spaces=uxQueueSpacesAvailable( uart->queue);
+    }
+    while(((spaces--) >0)&&(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr))) {
         c = uart->dev->fifo.rw_byte;
-        if(uart->queue != NULL && !xQueueIsQueueFull(uart->queue)) {
-            xQueueSend(uart->queue, &c);
-        }
+        xQueueSend(uart->queue, &c,0);
     }
 	UART_MUTEX_UNLOCK();
 }
@@ -197,12 +200,15 @@ uart_t* uartBegin(uint8_t uart_nr, uint32_t baudrate, uint32_t config, int8_t rx
         }
     }
     if(uart_nr == 1){
+        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART1_RST);
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART1_CLK_EN);
         DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART1_RST);
     } else if(uart_nr == 2){
+        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART2_RST);
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART2_CLK_EN);
         DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART2_RST);
     } else {
+        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART_RST);
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART_CLK_EN);
         DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART_RST);
     }
@@ -236,7 +242,23 @@ void uartEnd(uart_t* uart)
         return;
     }
 
+    uartDetachRx(uart); // release pin, disable interrupt
+    uartDetachTx(uart); // release pin
+
     UART_MUTEX_LOCK();
+
+    uart->dev->conf0.val = 0;
+    // power down uart, disable clocking
+    if(uart->num == 1){
+        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART1_RST);
+        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART1_CLK_EN);
+    } else if(uart->num == 2){
+        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART2_RST);
+        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART2_CLK_EN);
+    } else {
+        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART_RST);
+        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART_CLK_EN);
+    }
     if(uart->queue != NULL) {
         uint8_t c;
         while(xQueueReceive(uart->queue, &c, 0));
@@ -244,12 +266,8 @@ void uartEnd(uart_t* uart)
         uart->queue = NULL;
     }
 
-    uart->dev->conf0.val = 0;
-
     UART_MUTEX_UNLOCK();
 
-    uartDetachRx(uart);
-    uartDetachTx(uart);
 }
 
 size_t uartResizeRxBuffer(uart_t * uart, size_t new_size) {
@@ -277,7 +295,7 @@ uint32_t uartAvailable(uart_t* uart)
     if(uart == NULL || uart->queue == NULL) {
         return 0;
     }
-	_uart_rx_flush(uart);
+    _uart_rx_flush(uart);
     return uxQueueMessagesWaiting(uart->queue);
 }
 
@@ -298,11 +316,11 @@ uint8_t uartRead(uart_t* uart)
     if(xQueueReceive(uart->queue, &c, 0)) {
         return c;
     } else {
-		_uart_rx_flush(uart);
-		if(xQueueReceive(uart->queue, &c, 0)) {
-			return c;
-		}
-	}
+        _uart_rx_flush(uart);
+        if(xQueueReceive(uart->queue, &c, 0)) {
+            return c;
+        }
+    }
     return 0;
 }
 
@@ -315,11 +333,11 @@ uint8_t uartPeek(uart_t* uart)
     if(xQueuePeek(uart->queue, &c, 0)) {
         return c;
     } else {
-		_uart_rx_flush(uart);
-		if(xQueueReceive(uart->queue, &c, 0)) {
-			return c;
-		}
-	}
+        _uart_rx_flush(uart);
+        if(xQueueReceive(uart->queue, &c, 0)) {
+            return c;
+        }
+    }
     return 0;
 }
 
