@@ -32,10 +32,10 @@ extern "C" {
 #include "Wire.h"
 #include "Arduino.h"
 
-TwoWire::TwoWire(uint8_t bus_num)
-    :num(bus_num & 1)
-    ,sda(-1)
+TwoWire::TwoWire():
+    sda(-1)
     ,scl(-1)
+    ,_freq(100000)
     ,i2c(NULL)
     ,rxIndex(0)
     ,rxLength(0)
@@ -46,16 +46,18 @@ TwoWire::TwoWire(uint8_t bus_num)
     ,txQueued(0)
     ,transmitting(0)
     ,last_error(I2C_ERROR_OK)
+    ,i2cQ(NULL)
     ,_timeOutMillis(50)
+    
 {}
 
 TwoWire::~TwoWire()
 {
-    flush();
     if(i2c) {
-        i2cRelease(i2c);
+        i2cRelease(i2c,&i2cQ);
         i2c=NULL;
     }
+    TwoWire(); // reinit to default 
 }
 
 bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
@@ -93,12 +95,28 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
             }
         }
     }
-
+    if(i2c ){ // need to close existing
+        log_i("close existing(%p) i2c=%p q=%p",this,i2c,i2cQ);
+        flush();
+        i2cRelease(i2c,&i2cQ);
+        i2c=NULL;
+    }
+    
+    if( frequency == 0){ // reuse existing frequency
+        }
+    } else if((frequency <10000)||(frequency > 2000000)) {
+        _freq = 100000;
+    } else {
+        _freq = frequency;
+    }
     sda = sdaPin;
     scl = sclPin;
-    i2c = i2cInit(num, sdaPin, sclPin, frequency);
-    if(!i2c) {
+    last_error = i2cInit(sdaPin, sclPin, _freq,&i2cQ,&i2c);
+    if(last_error) {
+        log_e("(%p)init Failed %d(%s)",this,last_error,getErrorText(last_error));
         return false;
+    } else {
+        log_i(" using TwoWire(%p)=%p,q=%p)",this,i2c,i2cQ);
     }
 
     flush();
@@ -130,13 +148,13 @@ size_t TwoWire::getClock()
  */
 i2c_err_t TwoWire::writeTransmission(uint16_t address, uint8_t *buff, uint16_t size, bool sendStop)
 {
-    last_error = i2cWrite(i2c, address, buff, size, sendStop, _timeOutMillis);
+    last_error = i2cWrite(i2c, i2cQ, address, buff, size, sendStop, _timeOutMillis);
     return last_error;
 }
 
 i2c_err_t TwoWire::readTransmission(uint16_t address, uint8_t *buff, uint16_t size, bool sendStop, uint32_t *readCount)
 {
-    last_error = i2cRead(i2c, address, buff, size, sendStop, _timeOutMillis, readCount);
+    last_error = i2cRead(i2c, i2cQ, address, buff, size, sendStop, _timeOutMillis, readCount);
     return last_error;
 }
 
@@ -268,7 +286,7 @@ void TwoWire::flush(void)
     txLength = 0;
     rxQueued = 0;
     txQueued = 0;
-    i2cFlush(i2c); // cleanup
+    i2cFlush(i2c,i2cQ); // cleanup
 }
 
 uint8_t TwoWire::requestFrom(uint8_t address, uint8_t quantity, uint8_t sendStop)
@@ -360,12 +378,36 @@ char * TwoWire::getErrorText(uint8_t err)
  */
  
 uint32_t TwoWire::setDebugFlags( uint32_t setBits, uint32_t resetBits){
-  return i2cDebug(i2c,setBits,resetBits);
+  return i2cDebug(i2cQ,setBits,resetBits);
 }
 
 bool TwoWire::busy(void){
   return ((i2cGetStatus(i2c) & 16 )==16);
 }
 
-TwoWire Wire = TwoWire(0);
-TwoWire Wire1 = TwoWire(1);
+bool TwoWire::beginTransaction(int32_t timeOutMillis, uint32_t * inCount){
+  if(timeOutMillis == -1) timeOutMillis = _timeOutMillis;
+  uint32_t count;
+  last_error = i2cGetLock(i2c,i2cQ,timeOutMillis,&count);
+  if(inCount) *inCount = count;
+  if(last_error !=I2C_ERROR_OK ) 
+    log_e("(%p)lock get fail =%d, count=%d",this,last_error,count);
+  return (last_error==I2C_ERROR_OK);
+}
+
+bool TwoWire::endTransaction(uint32_t * inCount){
+  uint32_t count;
+  last_error = i2cReleaseLock(i2c,i2cQ,&count);
+  if(count!=0) {
+      log_d("(%p)- count=%d",this,count);
+  }
+  if(last_error != I2C_ERROR_OK) {
+      log_e("(%p)release Lock failed=%d, count=%d",this,last_error,count);
+  }
+  if(inCount) {
+      *inCount = count;
+  }
+  return (last_error==I2C_ERROR_OK);
+}
+
+TwoWire Wire = TwoWire();
