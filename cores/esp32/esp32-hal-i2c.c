@@ -23,7 +23,6 @@
 #include "soc/i2c_reg.h"
 #include "soc/i2c_struct.h"
 #include "soc/dport_reg.h"
-#include "soc/rtc.h" // support clk speed switching
 #include "esp_attr.h"
 
 //#define I2C_DEV(i)   (volatile i2c_dev_t *)((i)?DR_REG_I2C1_EXT_BASE:DR_REG_I2C_EXT_BASE)
@@ -43,7 +42,7 @@ ENABLE_I2C_DEBUG_BUFFER
   I would recommend you leave it commented out.
   */
 
-//#define ENABLE_I2C_DEBUG_BUFFER
+#define ENABLE_I2C_DEBUG_BUFFER
 
 #if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO) && (defined ENABLE_I2C_DEBUG_BUFFER)
 #define INTBUFFMAX 64
@@ -143,7 +142,7 @@ typedef enum {
 // control record for each dq entry
 typedef union {
     struct {
-        uint32_t  addr: 16; // I2C address, if 10bit must have 0x7800 mask applied, else 8bit
+        uint32_t  addr: 16; // I2C address, Encoded for use. 
         uint32_t  mode:         1; // transaction direction 0 write, 1 read
         uint32_t  stop:         1; // sendStop 0 no, 1 yes
         uint32_t  startCmdSent: 1; // START cmd has been added to command[]
@@ -167,20 +166,9 @@ typedef struct {
     EventGroupHandle_t queueEvent;  // optional user supplied for Async feedback EventBits
 } I2C_DATA_QUEUE_t;
 
-struct i2c_struct_t {
-    i2c_dev_t * dev;
-#if !CONFIG_DISABLE_HAL_LOCKS
-    xSemaphoreHandle lock;
-#endif
-    uint8_t num;
-    int8_t sda;
-    int8_t scl;
-    I2C_MODE_t mode;
-    I2C_STAGE_t stage;
-    I2C_ERROR_t error;
-    EventGroupHandle_t i2c_event; // a way to monitor ISR process
-    // maybe use it to trigger callback for OnRequest()
-    intr_handle_t intr_handle;       /*!< I2C interrupt handle*/
+/* DataQueue Control block, 08DEC2018 allow multiThreaded i2c access
+*/
+struct i2c_queue_block_t{
     I2C_DATA_QUEUE_t * dq;
     uint16_t queueCount; // number of dq entries in queue.
     uint16_t queuePos; // current queue that still has or needs data (out/in)
@@ -188,7 +176,27 @@ struct i2c_struct_t {
     uint16_t errorQueue; // errorByteCnt is in this queue,(for error locus)
     uint32_t exitCode;
     uint32_t debugFlags;
-};
+    uint32_t clockFreq;
+};  
+
+struct i2c_struct_t {
+    i2c_dev_t * dev;
+#if !CONFIG_DISABLE_HAL_LOCKS
+    xSemaphoreHandle lock;
+    uint32_t lockCount;
+#endif
+    uint8_t num;
+    int8_t sda;
+    int8_t scl;
+    uint8_t openCount;
+    I2C_MODE_t mode;
+    I2C_STAGE_t stage;
+    I2C_ERROR_t error;
+    EventGroupHandle_t i2c_event; // a way to monitor ISR process
+    // maybe use it to trigger callback for OnRequest()
+    intr_handle_t intr_handle;       /*!< I2C interrupt handle*/
+    i2c_queue_t * qb;
+    };
 
 enum {
     I2C_CMD_RSTART,
@@ -203,16 +211,16 @@ enum {
 #define I2C_MUTEX_UNLOCK()
 
 static i2c_t _i2c_bus_array[2] = {
-    {(volatile i2c_dev_t *)(DR_REG_I2C_EXT_BASE_FIXED), 0, -1, -1,I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL,0,0,0,0,0},
-    {(volatile i2c_dev_t *)(DR_REG_I2C1_EXT_BASE_FIXED), 1, -1, -1,I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL,0,0,0,0,0}
+    {(volatile i2c_dev_t *)(DR_REG_I2C_EXT_BASE_FIXED), 0, -1, -1, 0,I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL},
+    {(volatile i2c_dev_t *)(DR_REG_I2C1_EXT_BASE_FIXED), 1, -1, -1, 0,I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL}
 };
 #else
-#define I2C_MUTEX_LOCK()    do {} while (xSemaphoreTake(i2c->lock, portMAX_DELAY) != pdPASS)
-#define I2C_MUTEX_UNLOCK()  xSemaphoreGive(i2c->lock)
+#define I2C_MUTEX_LOCK()    do {} while (xSemaphoreTakeRecursive(i2c->lock, portMAX_DELAY) != pdTRUE); i2c->lockCount++
+#define I2C_MUTEX_UNLOCK()  i2c->lockCount--; xSemaphoreGiveRecursive(i2c->lock)
 
 static i2c_t _i2c_bus_array[2] = {
-    {(volatile i2c_dev_t *)(DR_REG_I2C_EXT_BASE_FIXED), NULL, 0, -1, -1, I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL,0,0,0,0,0,0},
-    {(volatile i2c_dev_t *)(DR_REG_I2C1_EXT_BASE_FIXED), NULL, 1, -1, -1,I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL,0,0,0,0,0,0}
+    {(volatile i2c_dev_t *)(DR_REG_I2C_EXT_BASE_FIXED), NULL, 0, 0, -1, -1, 0, I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL},
+    {(volatile i2c_dev_t *)(DR_REG_I2C1_EXT_BASE_FIXED), NULL, 0, 1, -1, -1, 0, I2C_NONE,I2C_NONE,I2C_ERROR_OK,NULL,NULL,NULL}
 };
 #endif
 
@@ -250,20 +258,20 @@ static void IRAM_ATTR i2cDumpCmdQueue(i2c_t *i2c)
 /* Stickbreaker ISR mode debug support
  */
 #if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)
-static void i2cDumpDqData(i2c_t * i2c)
+static void i2cDumpDqData(i2c_queue_t * inQb)
 {
 #if defined (ENABLE_I2C_DEBUG_BUFFER)
     uint16_t a=0;
     char buff[140];
     I2C_DATA_QUEUE_t *tdq;
     int digits=0,lenDigits=0;
-    a = i2c->queueCount;
+    a = inQb->queueCount;
     while(a>0) {
         digits++;
         a /= 10;
     }
-    while(a<i2c->queueCount) { // find maximum number of len decimal digits for formatting
-        if (i2c->dq[a].length > lenDigits ) lenDigits = i2c->dq[a].length;
+    while(a<inQb->queueCount) { // find maximum number of len decimal digits for formatting
+        if (inQb->dq[a].length > lenDigits ) lenDigits = inQb->dq[a].length;
         a++;
     }
     a=0;
@@ -273,8 +281,8 @@ static void i2cDumpDqData(i2c_t * i2c)
     }
     lenDigits = a;
     a = 0;
-    while(a<i2c->queueCount) {
-        tdq=&i2c->dq[a];
+    while(a<inQb->queueCount) {
+        tdq=&inQb->dq[a];
         char buf1[10],buf2[10];
         sprintf(buf1,"%0*d",lenDigits,tdq->length);
         sprintf(buf2,"%0*d",lenDigits,tdq->position);
@@ -312,14 +320,27 @@ static void i2cDumpDqData(i2c_t * i2c)
     log_i("Debug Buffer not Enabled");
 #endif
 }
-#endif
-#if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO
+
+static void i2cDumpQueueBlock(i2c_queue_t * inQb) 
+{
+    log_i("qb=%p",inQb);
+    if(inQb) {
+        log_i("dq=%p",inQb->dq);
+        log_i("queueCount=%d",inQb->queueCount);
+        log_i("queuePos=%d",inQb->queuePos);
+        log_i("errorByteCnt=%d",inQb->errorByteCnt);
+        log_i("errorQueue=%d",inQb->errorQueue);
+        log_i("debugFlags=0x%08X",inQb->debugFlags);
+        i2cDumpDqData(inQb);
+    }
+}
+
 static void i2cDumpI2c(i2c_t * i2c)
 {
-    log_e("i2c=%p",i2c);
+    log_i("i2c=%p",i2c);
     log_i("dev=%p date=%p",i2c->dev,i2c->dev->date);
 #if !CONFIG_DISABLE_HAL_LOCKS
-    log_i("lock=%p",i2c->lock);
+    log_i("lock=%p count=",i2c->lock,i2c->lockCount);
 #endif
     log_i("num=%d",i2c->num);
     log_i("mode=%d",i2c->mode);
@@ -327,19 +348,11 @@ static void i2cDumpI2c(i2c_t * i2c)
     log_i("error=%d",i2c->error);
     log_i("event=%p bits=%x",i2c->i2c_event,(i2c->i2c_event)?xEventGroupGetBits(i2c->i2c_event):0);
     log_i("intr_handle=%p",i2c->intr_handle);
-    log_i("dq=%p",i2c->dq);
-    log_i("queueCount=%d",i2c->queueCount);
-    log_i("queuePos=%d",i2c->queuePos);
-    log_i("errorByteCnt=%d",i2c->errorByteCnt);
-    log_i("errorQueue=%d",i2c->errorQueue);
-    log_i("debugFlags=0x%08X",i2c->debugFlags);
-    if(i2c->dq) {
-        i2cDumpDqData(i2c);
+    if(i2c->qb) {
+      i2cDumpQueueBlock(i2c);
     }
 }
-#endif
 
-#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)  
 static void i2cDumpInts(uint8_t num)
 {
 #if defined (ENABLE_I2C_DEBUG_BUFFER)
@@ -355,9 +368,8 @@ static void i2cDumpInts(uint8_t num)
     log_i("Debug Buffer not Enabled");
 #endif
 }
-#endif
 
-#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)&&(defined ENABLE_I2C_DEBUG_BUFFER)
+#if (defined ENABLE_I2C_DEBUG_BUFFER)
 static void IRAM_ATTR i2cDumpStatus(i2c_t * i2c){
     typedef union {
         struct {
@@ -387,7 +399,7 @@ static void IRAM_ATTR i2cDumpStatus(i2c_t * i2c){
 }
 #endif
 
-#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)&&(defined ENABLE_I2C_DEBUG_BUFFER)
+#if (defined ENABLE_I2C_DEBUG_BUFFER)
 static void i2cDumpFifo(i2c_t * i2c){
 char buf[64];
 uint16_t k = 0;
@@ -432,19 +444,22 @@ if(i != fifoPos){// actual data
 }
 #endif
 
-static void IRAM_ATTR i2cTriggerDumps(i2c_t * i2c, uint8_t trigger, const char locus[]){
-#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)&&(defined ENABLE_I2C_DEBUG_BUFFER)
+static void IRAM_ATTR i2cTriggerDumps(i2c_t * i2c, i2c_queue_t * inQb, uint8_t trigger, const char locus[]){
     if( trigger ){
-      log_i("%s",locus);      
-      if(trigger & 1) i2cDumpI2c(i2c);
-      if(trigger & 2) i2cDumpInts(i2c->num);
-      if(trigger & 4) i2cDumpCmdQueue(i2c);
-      if(trigger & 8) i2cDumpStatus(i2c);
-      if(trigger & 16) i2cDumpFifo(i2c);
+        if (i2c->qb == inQb){
+            log_i("%s",locus);      
+            if(trigger & 1) i2cDumpI2c(i2c);
+            if(trigger & 2) i2cDumpInts(i2c->num);
+            if(trigger & 4) i2cDumpCmdQueue(i2c);
+            if(trigger & 8) i2cDumpStatus(i2c);
+            if(trigger & 16) i2cDumpFifo(i2c);
+        } else {
+            i2cDumpQueueBlock(inQb);
+        }
     }
-#endif    
 }
  // end of debug support routines
+#endif 
  
 static void IRAM_ATTR i2cSetCmd(i2c_t * i2c, uint8_t index, uint8_t op_code, uint8_t byte_num, bool ack_val, bool ack_exp, bool ack_check)
 {
@@ -464,7 +479,7 @@ static void IRAM_ATTR fillCmdQueue(i2c_t * i2c, bool INTS)
     /* this function is called on initial i2cProcQueue() or when a I2C_END_DETECT_INT occurs
      */
     uint16_t cmdIdx = 0;
-    uint16_t qp = i2c->queuePos; // all queues before queuePos have been completely processed,
+    uint16_t qp = i2c->qb->queuePos; // all queues before queuePos have been completely processed,
       // so look start by checking the 'current queue' so see if it needs commands added to
       // hardware peripheral command list. walk through each queue entry until all queues have been
       // checked
@@ -473,8 +488,8 @@ static void IRAM_ATTR fillCmdQueue(i2c_t * i2c, bool INTS)
     bool ena_rx=false; // if we add a read op, better enable Rx_Fifo IRQ
     bool ena_tx=false; // if we add a Write op, better enable TX_Fifo IRQ
 
-    while(!needMoreCmds&&(qp < i2c->queueCount)) { // check if more possible cmds
-        if(i2c->dq[qp].ctrl.stopCmdSent) {// marks that all required cmds[] have been added to peripheral 
+    while(!needMoreCmds&&(qp < i2c->qb->queueCount)) { // check if more possible cmds
+        if(i2c->qb->dq[qp].ctrl.stopCmdSent) {// marks that all required cmds[] have been added to peripheral 
             qp++;
         } else {
             needMoreCmds=true;
@@ -485,7 +500,7 @@ static void IRAM_ATTR fillCmdQueue(i2c_t * i2c, bool INTS)
 
     while(!done) { // fill the command[] until either 0..14 filled or out of cmds and last cmd is STOP
         //CMD START
-        I2C_DATA_QUEUE_t *tdq=&i2c->dq[qp]; // simpler coding
+        I2C_DATA_QUEUE_t *tdq=&i2c->qb->dq[qp]; // simpler coding
 
         if((!tdq->ctrl.startCmdSent) && (cmdIdx < 14)) { // has this dq element's START command been added?
             // (cmdIdx<14)  because a START op cannot directly precede an END op, else a time out cascade occurs
@@ -598,8 +613,8 @@ static void IRAM_ATTR fillCmdQueue(i2c_t * i2c, bool INTS)
         if(!done) {
             if(tdq->ctrl.stopCmdSent) { // this queue element has been completely added to command[] buffer
                 qp++;
-                if(qp < i2c->queueCount) {
-                    tdq = &i2c->dq[qp];
+                if(qp < i2c->qb->queueCount) {
+                    tdq = &i2c->qb->dq[qp];
                 } else {
                     done = true;
                 }
@@ -624,12 +639,12 @@ static void IRAM_ATTR fillTxFifo(i2c_t * i2c)
     overlap is not an issue, just keep them full/empty the status_reg.xx_fifo_cnt
     tells the truth. And the INT's fire correctly
      */
-    uint16_t a=i2c->queuePos; // currently executing dq,
+    uint16_t a=i2c->qb->queuePos; // currently executing dq,
     bool full=!(i2c->dev->status_reg.tx_fifo_cnt<31);
     uint8_t cnt;
     bool rxQueueEncountered = false;
-    while((a < i2c->queueCount) && !full) {
-        I2C_DATA_QUEUE_t *tdq = &i2c->dq[a];
+    while((a < i2c->qb->queueCount) && !full) {
+        I2C_DATA_QUEUE_t *tdq = &i2c->qb->dq[a];
         cnt=0;
         // add to address to fifo ctrl.addr already has R/W bit positioned correctly
         if(tdq->ctrl.addrSent < tdq->ctrl.addrReq) { // need to send address bytes
@@ -683,8 +698,8 @@ static void IRAM_ATTR fillTxFifo(i2c_t * i2c)
         } else { // read Queue Encountered, can't update QueuePos past this point, emptyRxfifo will do it
             if( ! rxQueueEncountered ) {
               rxQueueEncountered = true;
-              if(a > i2c->queuePos){
-                i2c->queuePos = a; 
+              if(a > i2c->qb->queuePos){
+                i2c->qb->queuePos = a; 
               }
            }              
         }
@@ -701,7 +716,7 @@ static void IRAM_ATTR fillTxFifo(i2c_t * i2c)
         }
     }
 
-    if(a >= i2c->queueCount ) { // disable TX IRQ, all tx Data has been queued
+    if(a >= i2c->qb->queueCount ) { // disable TX IRQ, all tx Data has been queued
         i2c->dev->int_ena.tx_fifo_empty= 0;
     }
 
@@ -715,16 +730,16 @@ static void IRAM_ATTR emptyRxFifo(i2c_t * i2c)
     
     moveCnt = i2c->dev->status_reg.rx_fifo_cnt;//no need to check the reg until this many are read
 
-    while((moveCnt > 0)&&(i2c->queuePos < i2c->queueCount)){ // data to move    
+    while((moveCnt > 0)&&(i2c->qb->queuePos < i2c->qb->queueCount)){ // data to move    
 
-        I2C_DATA_QUEUE_t *tdq =&i2c->dq[i2c->queuePos]; //short cut
+        I2C_DATA_QUEUE_t *tdq =&i2c->qb->dq[i2c->qb->queuePos]; //short cut
 
-        while((tdq->position >= tdq->length)&&( i2c->queuePos < i2c->queueCount)){ // find were to store
-            i2c->queuePos++;
-            tdq = &i2c->dq[i2c->queuePos];
+        while((tdq->position >= tdq->length)&&( i2c->qb->queuePos < i2c->qb->queueCount)){ // find were to store
+            i2c->qb->queuePos++;
+            tdq = &i2c->qb->dq[i2c->qb->queuePos];
         }
       
-        if(i2c->queuePos >= i2c->queueCount){ // bad stuff, rx data but no place to put it!
+        if(i2c->qb->queuePos >= i2c->qb->queueCount){ // bad stuff, rx data but no place to put it!
             log_e("no Storage location for %d",moveCnt);
         // discard
             while(moveCnt>0){
@@ -741,7 +756,7 @@ static void IRAM_ATTR emptyRxFifo(i2c_t * i2c)
                 moveCnt = (tdq->length - tdq->position);
             }
         } else {// error
-            log_e("RxEmpty(%d) call on TxBuffer? dq=%d",moveCnt,i2c->queuePos);
+            log_e("RxEmpty(%d) call on TxBuffer? dq=%d",moveCnt,i2c->qb->queuePos);
         // discard
             while(moveCnt>0){
                 d = i2c->dev->fifo_data.val;
@@ -791,13 +806,13 @@ static void IRAM_ATTR i2cIsrExit(i2c_t * i2c,const uint32_t eventCode,bool Fatal
         i2c->error = I2C_ERROR;
     }
     uint32_t exitCode = EVENT_DONE | eventCode |(Fatal?EVENT_ERROR:0);
-    if((i2c->queuePos < i2c->queueCount) && (i2c->dq[i2c->queuePos].ctrl.mode == 1)) {
+    if((i2c->qb->queuePos < i2c->qb->queueCount) && (i2c->qb->dq[i2c->qb->queuePos].ctrl.mode == 1)) {
         emptyRxFifo(i2c);    // grab last few characters
     }
     i2c->dev->int_ena.val = 0; // shut down interrupts
     i2c->dev->int_clr.val = 0x1FFF;
     i2c->stage = I2C_DONE;
-    i2c->exitCode = exitCode; //true eventcode
+    i2c->qb->exitCode = exitCode; //true eventcode
 
     portBASE_TYPE HPTaskAwoken = pdFALSE,xResult;
     // try to notify Dispatch we are done,
@@ -824,22 +839,22 @@ static void IRAM_ATTR i2c_update_error_byte_cnt(i2c_t * i2c)
     uint16_t a=0; // start at top of DQ, count how many bytes added to tx fifo, and received from rx_fifo.
     int16_t bc = 0;
     I2C_DATA_QUEUE_t *tdq;
-    i2c->errorByteCnt = 0; 
-    while( a < i2c->queueCount){ // add up all bytes loaded into fifo's
-        tdq = &i2c->dq[a];
-        i2c->errorByteCnt += tdq->ctrl.addrSent;
-        i2c->errorByteCnt += tdq->position; 
+    i2c->qb->errorByteCnt = 0; 
+    while( a < i2c->qb->queueCount){ // add up all bytes loaded into fifo's
+        tdq = &i2c->qb->dq[a];
+        i2c->qb->errorByteCnt += tdq->ctrl.addrSent;
+        i2c->qb->errorByteCnt += tdq->position; 
         a++;
     }
   // now errorByteCnt contains total bytes moved into and out of FIFO's
   // but, there may still be bytes waiting in Fifo's
-    i2c->errorByteCnt -= i2c->dev->status_reg.tx_fifo_cnt; // waiting to go out;
-    i2c->errorByteCnt += i2c->dev->status_reg.rx_fifo_cnt; // already received
+    i2c->qb->errorByteCnt -= i2c->dev->status_reg.tx_fifo_cnt; // waiting to go out;
+    i2c->qb->errorByteCnt += i2c->dev->status_reg.rx_fifo_cnt; // already received
 // now walk thru DQ again, find which byte is 'current'
-    bc = i2c->errorByteCnt;
-    i2c->errorQueue = 0;
-    while( i2c->errorQueue < i2c->queueCount ){
-        tdq = &i2c->dq[i2c->errorQueue];
+    bc = i2c->qb->errorByteCnt;
+    i2c->qb->errorQueue = 0;
+    while( i2c->qb->errorQueue < i2c->qb->queueCount ){
+        tdq = &i2c->qb->dq[i2c->qb->errorQueue];
         if(bc>0){ // not found yet
             if( tdq->ctrl.addrSent >= bc){ // in address
                 bc = -1; // in address
@@ -854,10 +869,10 @@ static void IRAM_ATTR i2c_update_error_byte_cnt(i2c_t * i2c)
             }
         } else break;
         
-        i2c->errorQueue++;
+        i2c->qb->errorQueue++;
     }  
   
-    i2c->errorByteCnt = bc;
+    i2c->qb->errorByteCnt = bc;
  }
 
 static void IRAM_ATTR i2c_isr_handler_default(void* arg)
@@ -876,7 +891,7 @@ static void IRAM_ATTR i2c_isr_handler_default(void* arg)
     }
     while (activeInt != 0) { // Ordering of 'if(activeInt)' statements is important, don't change
 
-    #if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO) && (defined ENABLE_I2C_DEBUG_BUFFER)
+#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO) && (defined ENABLE_I2C_DEBUG_BUFFER)
         if(activeInt==(intBuff[intPos[p_i2c->num]][0][p_i2c->num]&0x1fff)) {
             intBuff[intPos[p_i2c->num]][0][p_i2c->num] = (((intBuff[intPos[p_i2c->num]][0][p_i2c->num]>>16)+1)<<16)|activeInt;
         } else {
@@ -916,7 +931,7 @@ static void IRAM_ATTR i2c_isr_handler_default(void* arg)
         if (activeInt & I2C_ACK_ERR_INT_ST_M) {//fatal error, abort i2c service
             if (p_i2c->mode == I2C_MASTER) {
                 i2c_update_error_byte_cnt(p_i2c); // calc which byte caused ack Error, check if address or data
-                if(p_i2c->errorByteCnt < 0 ) { // address
+                if(p_i2c->qb->errorByteCnt < 0 ) { // address
                     i2cIsrExit(p_i2c,EVENT_ERROR_NAK,true);
                 } else {
                     i2cIsrExit(p_i2c,EVENT_ERROR_DATA_NAK,true); //data
@@ -984,12 +999,12 @@ static void IRAM_ATTR i2c_isr_handler_default(void* arg)
 /* Stickbreaker added for ISR 11/2017
 functional with Silicon date=0x16042000
  */
-static i2c_err_t i2cAddQueue(i2c_t * i2c,uint8_t mode, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen,bool sendStop, bool dataOnly, EventGroupHandle_t event)
+static i2c_err_t i2cAddQueue(i2c_queue_t * qb,uint8_t mode, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen,bool sendStop, bool dataOnly, EventGroupHandle_t event)
 {
     // need to grab a MUTEX for exclusive Queue,
     // what about if ISR is running?
 
-    if(i2c==NULL) {
+    if(qb==NULL) {
         return I2C_ERROR_DEV;
     }
 
@@ -998,7 +1013,10 @@ static i2c_err_t i2cAddQueue(i2c_t * i2c,uint8_t mode, uint16_t i2cDeviceAddr, u
     dqx.length = dataLen;
     dqx.position = 0;
     dqx.cmdBytesNeeded = dataLen;
-    dqx.ctrl.val = 0;
+    dqx.ctrl.val = 0; // set all ctrl options to zero
+    dqx.ctrl.mode = mode;
+    dqx.ctrl.stop= sendStop;
+    dqx.queueEvent = event;
     if( dataOnly) {
      /* special case to add a queue data only element.
         START and devAddr will not be sent, this dq element can have a STOP.
@@ -1011,31 +1029,35 @@ static i2c_err_t i2cAddQueue(i2c_t * i2c,uint8_t mode, uint16_t i2cDeviceAddr, u
     } else {
         dqx.ctrl.addrReq = ((i2cDeviceAddr&0xFC00)==0x7800)?2:1; // 10bit or 7bit address
     }
-    dqx.ctrl.addr = i2cDeviceAddr;
-    dqx.ctrl.mode = mode;
-    dqx.ctrl.stop= sendStop;
-    dqx.queueEvent = event;
-
+    // convert address field to required I2C format
+    dqx.ctrl.addr = 0;
+    if(dqx.ctrl.addrReq ==2) { // 10bit address
+        dqx.ctrl.addr =(( i2cDeviceAddr >> 7) & 0xFE) | dqx.ctrl.mode;
+        dqx.ctrl.addr = (dqx.ctrl.addr <<8) | (i2cDeviceAddr & 0xFF);
+    } else { // 7bit address
+        dqx.ctrl.addr = ((i2cDeviceAddr <<1)&0xFE) | dqx.ctrl.mode;
+    }
+    
     if(event) { // an eventGroup exist, so, initialize it
         xEventGroupClearBits(event, EVENT_MASK); // all of them
     }
 
-    if(i2c->dq!=NULL) { // expand
+    if(qb->dq!=NULL) { // expand
         //log_i("expand");
-        I2C_DATA_QUEUE_t* tq =(I2C_DATA_QUEUE_t*)realloc(i2c->dq,sizeof(I2C_DATA_QUEUE_t)*(i2c->queueCount +1));
+        I2C_DATA_QUEUE_t* tq =(I2C_DATA_QUEUE_t*)realloc(qb->dq,sizeof(I2C_DATA_QUEUE_t)*(qb->queueCount +1));
         if(tq!=NULL) { // ok
-            i2c->dq = tq;
-            memmove(&i2c->dq[i2c->queueCount++],&dqx,sizeof(I2C_DATA_QUEUE_t));
+            qb->dq = tq;
+            memmove(&qb->dq[qb->queueCount++],&dqx,sizeof(I2C_DATA_QUEUE_t));
         } else { // bad stuff, unable to allocate more memory!
             log_e("realloc Failure");
             return I2C_ERROR_MEMORY;
         }
     } else { // first Time
         //log_i("new");
-        i2c->queueCount=0;
-        i2c->dq =(I2C_DATA_QUEUE_t*)malloc(sizeof(I2C_DATA_QUEUE_t));
-        if(i2c->dq!=NULL) {
-            memmove(&i2c->dq[i2c->queueCount++],&dqx,sizeof(I2C_DATA_QUEUE_t));
+        qb->queueCount=0;
+        qb->dq =(I2C_DATA_QUEUE_t*)malloc(sizeof(I2C_DATA_QUEUE_t));
+        if(qb->dq!=NULL) {
+            memmove(&qb->dq[qb->queueCount++],&dqx,sizeof(I2C_DATA_QUEUE_t));
         } else {
             log_e("malloc failure");
             return I2C_ERROR_MEMORY;
@@ -1044,14 +1066,14 @@ static i2c_err_t i2cAddQueue(i2c_t * i2c,uint8_t mode, uint16_t i2cDeviceAddr, u
     return I2C_ERROR_OK;
 }
 
-i2c_err_t i2cAddQueueWrite(i2c_t * i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen,bool sendStop,EventGroupHandle_t event)
+i2c_err_t i2cAddQueueWrite(i2c_queue_t * qb, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen,bool sendStop,EventGroupHandle_t event)
 {
-    return i2cAddQueue(i2c,0,i2cDeviceAddr,dataPtr,dataLen,sendStop,false,event);
+    return i2cAddQueue(qb,0,i2cDeviceAddr,dataPtr,dataLen,sendStop,false,event);
 }
 
-i2c_err_t i2cAddQueueRead(i2c_t * i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen,bool sendStop,EventGroupHandle_t event)
+i2c_err_t i2cAddQueueRead(i2c_queue_t * qb, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen,bool sendStop,EventGroupHandle_t event)
 {
-    //10bit read is kind of weird, first you do a 0byte Write with 10bit
+    //10bit read is kind of weird, first you do a 0 data byte Write with 10bit
     //  address, then a ReSTART then a 7bit Read using the the upper 7bit +
     // readBit.
 
@@ -1060,17 +1082,17 @@ i2c_err_t i2cAddQueueRead(i2c_t * i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr,
     // this is the Industry Standard specification.
 
     if((i2cDeviceAddr &0xFC00)==0x7800) { // ten bit read
-        i2c_err_t err = i2cAddQueue(i2c,0,i2cDeviceAddr,NULL,0,false,false,event);
+        i2c_err_t err = i2cAddQueue(qb,0,i2cDeviceAddr,NULL,0,false,false,event);
         if(err==I2C_ERROR_OK) {
-            return i2cAddQueue(i2c,1,(i2cDeviceAddr>>8),dataPtr,dataLen,sendStop,false,event);
+            return i2cAddQueue(qb,1,(i2cDeviceAddr>>8),dataPtr,dataLen,sendStop,false,event);
         } else {
             return err;
         }
     }
-    return i2cAddQueue(i2c,1,i2cDeviceAddr,dataPtr,dataLen,sendStop,false,event);
+    return i2cAddQueue(qb,1,i2cDeviceAddr,dataPtr,dataLen,sendStop,false,event);
 }
 
-i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
+i2c_err_t i2cProcQueue(i2c_t * i2c, i2c_queue_t * inQb, uint32_t *readCount, uint16_t timeOutMillis)
 {
     /* do the hard stuff here
     install ISR if necessary
@@ -1084,7 +1106,14 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
     if(i2c == NULL) {
         return I2C_ERROR_DEV;
     }
-    if(i2c->debugFlags & 0xff000000) i2cTriggerDumps(i2c,(i2c->debugFlags>>24),"before ProcQueue");
+    
+    if(inQb == NULL){
+      log_e("invalid QueueBlock(%p)",inQb);
+      return I2C_ERROR_MEMORY;
+    }
+#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)
+    if(inQb->debugFlags & 0xff000000) i2cTriggerDumps(i2c,inQb,(inQb->debugFlags>>24),"before ProcQueue");
+#endif
     if (i2c->dev->status_reg.bus_busy) { // return error, let TwoWire() handle resetting the hardware.
         /* if multi master then this if should be changed to this 03/12/2018
         if(multiMaster){// try to let the bus clear by its self
@@ -1099,13 +1128,14 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
         return I2C_ERROR_BUSY;
     }
 
-    I2C_MUTEX_LOCK();
+    I2C_MUTEX_LOCK(); // other thread should hang here if multiple are using i2c? 08DEC18
     /* what about co-existence with SLAVE mode?
     Should I check if a slaveMode xfer is in progress and hang
     until it completes?
     if i2c->stage == I2C_RUNNING or I2C_SLAVE_ACTIVE
-     */
+    */
     i2c->stage = I2C_DONE; // until ready
+    i2c->qb = inQb; // assign data queue to peripheral 
 
 #if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO) && (defined ENABLE_I2C_DEBUG_BUFFER)
     for(uint16_t i=0; i<INTBUFFMAX; i++) {
@@ -1134,53 +1164,36 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
     i2c_err_t reason = I2C_ERROR_OK;
     i2c->mode = I2C_MASTER;
     i2c->dev->ctr.trans_start=0; // Pause Machine
+    i2cSetFrequency(i2c, i2c->qb->clockFreq);
+
     i2c->dev->timeout.tout = 0xFFFFF; // max 13ms
     i2c->dev->int_clr.val = 0x1FFF; // kill them All!
     
     i2c->dev->ctr.ms_mode = 1; // master!
-    i2c->queuePos=0;
-    i2c->errorByteCnt=0;
-    i2c->errorQueue = 0;
+    
+    i2c->qb->queuePos=0;
+    i2c->qb->errorByteCnt=0;
+    i2c->qb->errorQueue = 0;
     uint32_t totalBytes=0; // total number of bytes to be Moved!
-    // convert address field to required I2C format
-    while(i2c->queuePos < i2c->queueCount) { // need to push these address modes upstream, to AddQueue
-        I2C_DATA_QUEUE_t *tdq = &i2c->dq[i2c->queuePos++];
-        uint16_t taddr=0;
-        if(tdq->ctrl.addrReq ==2) { // 10bit address
-            taddr =((tdq->ctrl.addr >> 7) & 0xFE)
-                   |tdq->ctrl.mode;
-            taddr = (taddr <<8) | (tdq->ctrl.addr&0xFF);
-        } else { // 7bit address
-            taddr =  ((tdq->ctrl.addr<<1)&0xFE)
-                     |tdq->ctrl.mode;
-        }
-        tdq->ctrl.addr = taddr; // all fixed with R/W bit
-        totalBytes += tdq->length + tdq->ctrl.addrReq; // total number of byte to be moved!
+    for(auto i = 0;i<i2c->qb->queueCount; i++){
+        totalBytes += i2c->qb->dq->length + i2c->qb->dq->ctrl.addrReq; // total number of byte to be moved!
     }
-    i2c->queuePos=0;
 
     fillCmdQueue(i2c,false); // don't enable Tx/RX irq's
     // start adding command[], END irq will keep it full
     //Data Fifo will be filled after trans_start is issued
-    i2c->exitCode=0;
+    i2c->qb->exitCode=0;
 
     I2C_FIFO_CONF_t f;
     f.val = i2c->dev->fifo_conf.val;
     f.rx_fifo_rst = 1; // fifo in reset
     f.tx_fifo_rst = 1; // fifo in reset
     f.nonfifo_en = 0; // use fifo mode
-    f.nonfifo_tx_thres = 31;
-    // need to adjust threshold based on I2C clock rate, at 100k, 30 usually works,
-    // sometimes the emptyRx() actually moves 31 bytes
-    // it hasn't overflowed yet, I cannot tell if the new byte is added while
-    // emptyRX() is executing or before?
-  // let i2cSetFrequency() set thrhds  
-  //   f.rx_fifo_full_thrhd = 30; // 30 bytes before INT is issued
-  //  f.tx_fifo_empty_thrhd = 0;
+    f.nonfifo_tx_thres = 31; // unused
     f.fifo_addr_cfg_en = 0; // no directed access
     i2c->dev->fifo_conf.val = f.val; // post them all
 
-    f.rx_fifo_rst = 0; // release fifo
+    f.rx_fifo_rst = 0; // release fifo reset
     f.tx_fifo_rst = 0;
     i2c->dev->fifo_conf.val = f.val; // post them all
 
@@ -1188,7 +1201,6 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
     // As soon as interrupts are enabled, the ISR will start handling them.
     // it should receive a TXFIFO_EMPTY immediately, even before it
     // receives the TRANS_START
-
     
     uint32_t interruptsEnabled =
         I2C_ACK_ERR_INT_ENA | // (BIT(10))  Causes Fatal Error Exit
@@ -1248,9 +1260,9 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
     // if xEventGroupSetBitsFromISR() failed, the ISR could have succeeded but never been
     // able to mark the success
 
-    if(i2c->exitCode!=eBits) { // try to recover from O/S failure
+    if(i2c->qb->exitCode!=eBits) { // try to recover from O/S failure
         //  log_e("EventGroup Failed:%p!=%p",eBits,i2c->exitCode);
-        eBits=i2c->exitCode;
+        eBits=i2c->qb->exitCode;
     }
     if((eBits&EVENT_ERROR)||(!(eBits & EVENT_DONE))){ // need accurate errorByteCnt for debug
       i2c_update_error_byte_cnt(i2c);
@@ -1291,7 +1303,7 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
         i2c->dev->int_ena.val =0;
         i2c->dev->int_clr.val = 0x1FFF;
         i2c_update_error_byte_cnt(i2c);
-        if((i2c->errorByteCnt == 0)&&(i2c->errorQueue==0)) { // Bus Busy no bytes Moved
+        if((i2c->qb->errorByteCnt == 0)&&(i2c->qb->errorQueue==0)) { // Bus Busy no bytes Moved
             reason = I2C_ERROR_BUSY;
             eBits = eBits | EVENT_ERROR_BUS_BUSY|EVENT_ERROR|EVENT_DONE;
 #if ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_DEBUG
@@ -1323,36 +1335,39 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, uint32_t *readCount, uint16_t timeOutMillis)
     */
     uint32_t b = 0;
 
-    while(b < i2c->queueCount) {
-        if(i2c->dq[b].ctrl.mode==1 && readCount) {
-            *readCount += i2c->dq[b].position; // number of data bytes received
+    while(b < i2c->qb->queueCount) {
+        if(i2c->qb->dq[b].ctrl.mode==1 && readCount) {
+            *readCount += i2c->qb->dq[b].position; // number of data bytes received
         }
-        if(b < i2c->queuePos) { // before any error
-            if(i2c->dq[b].queueEvent) { // this data queue element has an EventGroup
-                xEventGroupSetBits(i2c->dq[b].queueEvent,EVENT_DONE);
+        if(b < i2c->qb->queuePos) { // before any error
+            if(i2c->qb->dq[b].queueEvent) { // this data queue element has an EventGroup
+                xEventGroupSetBits(i2c->qb->dq[b].queueEvent,EVENT_DONE);
             }
-        } else if(b == i2c->queuePos) { // last processed queue
-            if(i2c->dq[b].queueEvent) { // this data queue element has an EventGroup
-                xEventGroupSetBits(i2c->dq[b].queueEvent,eBits);
+        } else if(b == i2c->qb->queuePos) { // last processed queue
+            if(i2c->qb->dq[b].queueEvent) { // this data queue element has an EventGroup
+                xEventGroupSetBits(i2c->qb->dq[b].queueEvent,eBits);
             }
         } else { // never processed queues
-            if(i2c->dq[b].queueEvent) { // this data queue element has an EventGroup
-                xEventGroupSetBits(i2c->dq[b].queueEvent,eBits|EVENT_ERROR_PREV);
+            if(i2c->qb->dq[b].queueEvent) { // this data queue element has an EventGroup
+                xEventGroupSetBits(i2c->qb->dq[b].queueEvent,eBits|EVENT_ERROR_PREV);
             }
         }
         b++;
     }
-    if(i2c->debugFlags & 0x00ff0000) i2cTriggerDumps(i2c,(i2c->debugFlags>>16),"after ProcQueue");
-
+#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)
+    if(i2c->qb->debugFlags & 0x00ff0000) i2cTriggerDumps(i2c,i2c->qb,(i2c->qb->debugFlags>>16),"after ProcQueue");
+#endif
     I2C_MUTEX_UNLOCK();
     return reason;
 }
 
 static void i2cReleaseISR(i2c_t * i2c)
 {
-    if(i2c->intr_handle) {
-        esp_intr_free(i2c->intr_handle);
-        i2c->intr_handle=NULL;
+    if(i2c) {
+        if(i2c->intr_handle) {
+            esp_intr_free(i2c->intr_handle);
+            i2c->intr_handle=NULL;
+        }
     }
 }
 
@@ -1368,16 +1383,15 @@ static bool i2cCheckLineState(int8_t sda, int8_t scl){
 
     if(!digitalRead(sda) || !digitalRead(scl)) { // bus in busy state
         log_w("invalid state sda(%d)=%d, scl(%d)=%d", sda, digitalRead(sda), scl, digitalRead(scl));
-        digitalWrite(scl, HIGH);
         for(uint8_t a=0; a<9; a++) {
             delayMicroseconds(5);
+            if(digitalRead(sda)){ // bus recovered
+                log_d("Recovered after %d Cycles",a);
+                break;
+            }
             digitalWrite(scl, LOW);
             delayMicroseconds(5);
             digitalWrite(scl, HIGH);
-            if(digitalRead(sda)){ // bus recovered
-                log_d("Recovered after %d Cycles",a+1);
-                break;
-            }
         }
     }
 
@@ -1388,49 +1402,48 @@ static bool i2cCheckLineState(int8_t sda, int8_t scl){
     return true;
 }
 
-i2c_err_t i2cAttachSCL(i2c_t * i2c, int8_t scl)
+i2c_err_t i2cAttachSdaScl(i2c_t * i2c, int8_t sda, int8_t scl)
 {
     if(i2c == NULL) {
         return I2C_ERROR_DEV;
     }
+    
+    if((sda <0)||( scl <0)){
+        return I2C_ERROR_DEV;
+    }
+
+    i2c->scl = scl;
     digitalWrite(scl, HIGH);
     pinMode(scl, OPEN_DRAIN | PULLUP | INPUT | OUTPUT);
     pinMatrixOutAttach(scl, I2C_SCL_IDX(i2c->num), false, false);
     pinMatrixInAttach(scl, I2C_SCL_IDX(i2c->num), false);
-    return I2C_ERROR_OK;
-}
 
-i2c_err_t i2cDetachSCL(i2c_t * i2c, int8_t scl)
-{
-    if(i2c == NULL) {
-        return I2C_ERROR_DEV;
-    }
-    pinMatrixOutDetach(scl, false, false);
-    pinMatrixInDetach(I2C_SCL_IDX(i2c->num), false, false);
-    pinMode(scl, INPUT | PULLUP);
-    return I2C_ERROR_OK;
-}
-
-i2c_err_t i2cAttachSDA(i2c_t * i2c, int8_t sda)
-{
-    if(i2c == NULL) {
-        return I2C_ERROR_DEV;
-    }
+    i2c->sda = sda;
     digitalWrite(sda, HIGH);
     pinMode(sda, OPEN_DRAIN | PULLUP | INPUT | OUTPUT );
     pinMatrixOutAttach(sda, I2C_SDA_IDX(i2c->num), false, false);
     pinMatrixInAttach(sda, I2C_SDA_IDX(i2c->num), false);
+
     return I2C_ERROR_OK;
 }
 
-i2c_err_t i2cDetachSDA(i2c_t * i2c, int8_t sda)
+i2c_err_t i2cDetachSdaScl(i2c_t * i2c)
 {
     if(i2c == NULL) {
         return I2C_ERROR_DEV;
     }
-    pinMatrixOutDetach(sda, false, false);
-    pinMatrixInDetach(I2C_SDA_IDX(i2c->num), false, false);
-    pinMode(sda, INPUT | PULLUP);
+    if(i2c->scl >= 0){
+        pinMatrixOutDetach(i2c->scl, false, false);
+        pinMatrixInDetach(I2C_SCL_IDX(i2c->num), false, false);
+        pinMode(i2c->scl, INPUT | PULLUP);
+        i2c->scl = -1; // un attached
+    }
+    if(i2c->sda >= 0){
+        pinMatrixOutDetach(i2c->sda, false, false);
+        pinMatrixInDetach(I2C_SDA_IDX(i2c->num), false, false);
+        pinMode(i2c->sda, INPUT | PULLUP);
+        i2c->sda = -1; // un attached
+    }
     return I2C_ERROR_OK;
 }
 
@@ -1438,147 +1451,242 @@ i2c_err_t i2cDetachSDA(i2c_t * i2c, int8_t sda)
  * PUBLIC API
  * */
 // 24Nov17 only supports Master Mode
-i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t frequency) //before this is called, pins should be detached, else glitch
+i2c_err_t i2cInit(int8_t sda, int8_t scl, uint32_t frequency, i2c_queue_t ** inQb, i2c_t ** inI2c) 
 {
-  log_v("num=%d sda=%d scl=%d freq=%d",i2c_num, sda, scl, frequency);
-    if(i2c_num > 1) {
-        return NULL;
+  *inI2c = NULL; // init as failure
+  log_d("sda=%d scl=%d freq=%d q=%p", sda, scl, frequency,*inQb);
+    if( sda<0 || scl < 0) {
+        log_e("invalid pins sda=%d, scl=%d",sda,scl);
+        return I2C_ERROR_DEV;
     }
 
-    i2c_t * i2c = &_i2c_bus_array[i2c_num];
-
-    if(i2c->sda >= 0){
-        i2cDetachSDA(i2c, i2c->sda);
+// find which peripheral to use, start at 0, if pins match use it
+    uint8_t num = 0;
+    bool done = false;
+    i2c_t * i2c = NULL;
+    if((sda == _i2c_bus_array[0].sda)&&(scl == _i2c_bus_array[0].scl)){
+        num = 0;
+        done = true;
+    } else if(( sda == _i2c_bus_array[1].sda)&&(scl == _i2c_bus_array[1].scl)){
+        num = 1;
+        done = true;
     }
-    if(i2c->scl >= 0){
-        i2cDetachSCL(i2c, i2c->scl);
+    while((num < 2)&&(!done)){
+        i2c = &_i2c_bus_array[num];
+        if((i2c->sda == sda)&&(i2c->scl == scl)) { // matched
+            done = true;
+            log_d("reuse [%d](%d,%d)",num,sda,scl);
+        } else if( i2c->sda == -1){ // not in use
+            done = true;
+            log_d("first [%d](%d,%d)",num,sda,scl);
+        } else num++;
     }
-    i2c->sda = sda;
-    i2c->scl = scl;
-
+    
+    if(!done){ // all peripherals are in use
+        log_e("all i2cPeripherals in use");
+        return I2C_ERROR_DEV;
+    } 
+    log_d("using %d",num);
+    i2c = &_i2c_bus_array[num];
+    
 #if !CONFIG_DISABLE_HAL_LOCKS
     if(i2c->lock == NULL) {
-        i2c->lock = xSemaphoreCreateMutex();
+        i2c->lock = xSemaphoreCreateRecursiveMutex();
         if(i2c->lock == NULL) {
-            return NULL;
+            log_e("HAL LOCK create Failed");
+            return I2C_ERROR_MEMORY;
         }
     }
+ 
 #endif
+
     I2C_MUTEX_LOCK();
+    i2c->openCount++;
+    if(i2c->openCount ==1){ // init hardware, pins are not assigned, interrupt may exist
+        log_d("Initing hardware");
+ //       i2cReleaseISR(i2c); // ISR exists, release it before disabling hardware
 
-    i2cReleaseISR(i2c); // ISR exists, release it before disabling hardware
-
-    if(frequency == 0) {// don't change existing frequency
-        frequency = i2cGetFrequency(i2c);
         if(frequency == 0) {
             frequency = 100000L;    // default to 100khz
         }
+
+        if(i2c->num == 0) {
+            DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST); //reset hardware
+            DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT0_CLK_EN);
+            DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST);//  release reset
+        } else {
+            DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST); //reset Hardware
+            DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT1_CLK_EN);
+            DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST);
+        }
+        i2c->dev->ctr.val = 0;
+        i2c->dev->ctr.ms_mode = 1;
+        i2c->dev->ctr.sda_force_out = 1 ;
+        i2c->dev->ctr.scl_force_out = 1 ;
+        i2c->dev->ctr.clk_en = 1;
+
+        //the max clock number of receiving  a data
+        i2c->dev->timeout.tout = 400000;//clocks max=1048575
+        //disable apb nonfifo access
+        i2c->dev->fifo_conf.nonfifo_en = 0;
+
+        i2c->dev->slave_addr.val = 0;
+    
+        if( *inQb == NULL){ // acquire ram, init
+            *inQb = (i2c_queue_t*)calloc(sizeof(i2c_queue_t),1);
+            if(!*inQb) { // alloc failed
+                log_e("heap alloc failed for Queue");
+                i2cRelease(i2c,*inQb);
+#if !CONFIG_DISABLE_HAL_LOCKS
+                if(i2c->lock){
+                    I2C_MUTEX_UNLOCK();
+                }
+#endif
+                return I2C_ERROR_MEMORY;
+            }
+        } else {
+            memset(*inQb,0,sizeof(i2c_queue_t));
+        }
+        (*inQb)->clockFreq = frequency;
+        i2cSetFrequency(i2c, (*inQb)->clockFreq);
+        
+        if(!i2cCheckLineState(sda, scl)){
+            log_e("bad pin state");
+            i2cRelease(i2c,*inQb);
+#if !CONFIG_DISABLE_HAL_LOCKS
+            if(i2c->lock){
+                I2C_MUTEX_UNLOCK();
+            }
+#endif
+            return I2C_ERROR_DEV;
+        }
+
+        i2cAttachSdaScl(i2c, sda, scl);
+    } else { // hardware already configured and running, Recycle bus if necessary
+        log_d("openCount=%d, detaching pins for test sda=%d, scl=%d",i2c->openCount,i2c->sda,i2c->scl);
+        i2cDetachSdaScl(i2c);
+        if(!i2cCheckLineState(sda, scl)){
+            log_e("lineState failed");
+            i2cRelease(i2c,*inQb);
+#if !CONFIG_DISABLE_HAL_LOCKS
+            if(i2c->lock){
+                I2C_MUTEX_UNLOCK();
+            }
+#endif
+            return I2C_ERROR_DEV;
+        }
+        log_d("attaching pins sda=%d, scl=%d",sda,scl);
+        i2cAttachSdaScl(i2c,sda,scl);
+
+        if( *inQb == NULL){ // acquire ram, init
+            *inQb = (i2c_queue_t*)calloc(sizeof(i2c_queue_t),1);
+            if(!*inQb) { // alloc failed
+                log_e("heap alloc failed for Queue");
+                i2cRelease(i2c,*inQb);
+#if !CONFIG_DISABLE_HAL_LOCKS
+                if(i2c->lock){
+                    I2C_MUTEX_UNLOCK();
+                }
+#endif
+                return I2C_ERROR_MEMORY;
+            }
+        } else {
+            memset(*inQb,0,sizeof(i2c_queue_t));
+        }
+        (*inQb)->clockFreq = frequency;
+
     }
-
-    if(i2c_num == 0) {
-        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST); //reset hardware
-        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT0_CLK_EN);
-        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST);//  release reset
-    } else {
-        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST); //reset Hardware
-        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT1_CLK_EN);
-        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST);
-    }
-    i2c->dev->ctr.val = 0;
-    i2c->dev->ctr.ms_mode = 1;
-    i2c->dev->ctr.sda_force_out = 1 ;
-    i2c->dev->ctr.scl_force_out = 1 ;
-    i2c->dev->ctr.clk_en = 1;
-
-    //the max clock number of receiving  a data
-    i2c->dev->timeout.tout = 400000;//clocks max=1048575
-    //disable apb nonfifo access
-    i2c->dev->fifo_conf.nonfifo_en = 0;
-
-    i2c->dev->slave_addr.val = 0;
+    if(i2c->lockCount != 1) log_d("lc=%d",i2c->lockCount);  // init called inside a lock?
     I2C_MUTEX_UNLOCK();
-
-    i2cSetFrequency(i2c, frequency);    // reconfigure
-
-    if(!i2cCheckLineState(i2c->sda, i2c->scl)){
-        return NULL;
-    }
-
-    if(i2c->sda >= 0){
-        i2cAttachSDA(i2c, i2c->sda);
-    }
-    if(i2c->scl >= 0){
-        i2cAttachSCL(i2c, i2c->scl);
-    }
-    return i2c;
+    *inI2c = i2c;
+    return I2C_ERROR_OK;
 }
 
-void i2cRelease(i2c_t *i2c)  // release all resources, power down peripheral
+void i2cRelease(i2c_t *i2c, i2c_queue_t **inQb)  // release all resources, power down peripheral
 {
+    if(!i2c){
+        return I2C_ERROR_DEV;
+    }
+
     I2C_MUTEX_LOCK();
+    i2c->openCount--;
+    i2cFlush(i2c,*inQb);
+    if(*inQb) free(*inQb);
+    *inQb = NULL;
 
-    if(i2c->sda >= 0){
-        i2cDetachSDA(i2c, i2c->sda);
-    }
-    if(i2c->scl >= 0){
-        i2cDetachSCL(i2c, i2c->scl);
-    }
+    if( i2c->openCount == 0){
+        i2cDetachSdaScl(i2c);
 
-    i2cReleaseISR(i2c);
+        i2cReleaseISR(i2c);
 
-    if(i2c->i2c_event) {
-        vEventGroupDelete(i2c->i2c_event);
-        i2c->i2c_event = NULL;
-    }
-
-    i2cFlush(i2c);
+        if(i2c->i2c_event) {
+            vEventGroupDelete(i2c->i2c_event);
+            i2c->i2c_event = NULL;
+        }
 
     // reset the I2C hardware and shut off the clock, power it down.
-    if(i2c->num == 0) {
-        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST); //reset hardware
-        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT0_CLK_EN); // shutdown hardware
-    } else {
-        DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST); //reset Hardware
-        DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT1_CLK_EN); // shutdown Hardware
+        if(i2c->num == 0) {
+            DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT0_RST); //reset hardware
+            DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT0_CLK_EN); // shutdown hardware
+        } else {
+            DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG,DPORT_I2C_EXT1_RST); //reset Hardware
+            DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG,DPORT_I2C_EXT1_CLK_EN); // shutdown Hardware
+        }
+// leave Semaphore alive, perhaps other task is hanging on it, to Open I2c
     }
-
-    I2C_MUTEX_UNLOCK();
+#if !CONFIG_DISABLE_HAL_LOCKS
+    if(i2c->lock) {
+        while(xSemaphoreGiveRecursive(i2c->lock)==pdTRUE){
+            if(i2c->lockCount > 0){
+                i2c->lockCount--;
+            } else {
+                log_e("unwind pass end"); // lockCount did not equal actual FreeRTOS recursive count?
+            }
+        }
+        if(i2c->lockCount > 0) {
+          log_e("lockCount should be zero=%d",i2c->lockCount);
+          i2c->lockCount = 0;
+        }
+    }
+#endif 
 }
 
-i2c_err_t i2cFlush(i2c_t * i2c)
+i2c_err_t i2cFlush(i2c_t * i2c, i2c_queue_t * inQb)
 {
     if(i2c==NULL) {
         return I2C_ERROR_DEV;
     }
-    i2cTriggerDumps(i2c,i2c->debugFlags & 0xff, "FLUSH");
-
-    // need to grab a MUTEX for exclusive Queue,
-    // what out if ISR is running?
-    i2c_err_t rc=I2C_ERROR_OK;
-    if(i2c->dq!=NULL) {
-        //  log_i("free");
-        // what about EventHandle?
-        free(i2c->dq);
-        i2c->dq = NULL;
+#if (ARDUHAL_LOG_LEVEL >= ARDUHAL_LOG_LEVEL_INFO)
+    if(inQb){
+        i2cTriggerDumps(i2c, inQb, (inQb->debugFlags & 0xff), "FLUSH");
     }
-    i2c->queueCount=0;
-    i2c->queuePos=0;
-    // release Mutex
-    return rc;
+#endif
+    if(inQb){
+        if(inQb->dq!=NULL) {
+            //  log_i("free");
+            // what about EventHandle?
+            free(inQb->dq);
+            inQb->dq = NULL;
+        }
+        inQb->queueCount=0;
+        inQb->queuePos=0;
+    }
+    return I2C_ERROR_OK;
 }
 
-i2c_err_t i2cWrite(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis){
-    i2c_err_t last_error = i2cAddQueueWrite(i2c, address, buff, size, sendStop, NULL);
+i2c_err_t i2cWrite(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis){
+    if((!i2c)||(!inQb)){
+        return I2C_ERROR_DEV;
+    }
+    if(buff==NULL){
+        return I2C_ERROR_MEMORY;
+    }
+    i2c_err_t last_error = i2cAddQueueWrite(inQb, address, buff, size, sendStop, NULL);
 
     if(last_error == I2C_ERROR_OK) { //queued
         if(sendStop) { //now actually process the queued commands, including READs
-            last_error = i2cProcQueue(i2c, NULL, timeOutMillis);
-            if(last_error == I2C_ERROR_BUSY) { // try to clear the bus
-                if(i2cInit(i2c->num, i2c->sda, i2c->scl, 0)) {
-                    last_error = i2cProcQueue(i2c, NULL, timeOutMillis);
-                }
-            }
-            i2cFlush(i2c);
+            last_error = i2cProcQueue(i2c, inQb, NULL, timeOutMillis);
+            i2cFlush(i2c, inQb);
         } else { // stop not received, so wait for I2C stop,
             last_error = I2C_ERROR_CONTINUE;
         }
@@ -1586,18 +1694,19 @@ i2c_err_t i2cWrite(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, 
     return last_error;
 }
 
-i2c_err_t i2cRead(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis, uint32_t *readCount){
-    i2c_err_t last_error=i2cAddQueueRead(i2c, address, buff, size, sendStop, NULL);
+i2c_err_t i2cRead(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis, uint32_t *readCount){
+    if((!i2c)||(!inQb)){
+        return I2C_ERROR_DEV;
+    }
+    if(buff==NULL){
+        return I2C_ERROR_MEMORY;
+    }
+    i2c_err_t last_error=i2cAddQueueRead(inQb, address, buff, size, sendStop, NULL);
 
     if(last_error == I2C_ERROR_OK) { //queued
         if(sendStop) { //now actually process the queued commands, including READs
-            last_error = i2cProcQueue(i2c, readCount, timeOutMillis);
-            if(last_error == I2C_ERROR_BUSY) { // try to clear the bus
-                if(i2cInit(i2c->num, i2c->sda, i2c->scl, 0)) {
-                    last_error = i2cProcQueue(i2c, readCount, timeOutMillis);
-                }
-            }
-            i2cFlush(i2c);
+            last_error = i2cProcQueue(i2c, inQb, readCount, timeOutMillis);
+            i2cFlush(i2c,inQb);
         } else { // stop not received, so wait for I2C stop,
             last_error = I2C_ERROR_CONTINUE;
         }
@@ -1612,8 +1721,8 @@ i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed)
     }
     I2C_FIFO_CONF_t f;
   
-    // uint32_t period = (APB_CLK_FREQ/clk_speed) / 2;
-    uint32_t period = (rtc_clk_apb_freq_get()/clk_speed) / 2;
+    uint32_t period = (APB_CLK_FREQ/clk_speed) / 2;
+ //   uint32_t period = (rtc_clk_apb_freq_get()/clk_speed) / 2;
  
     uint32_t halfPeriod = period/2;
     uint32_t quarterPeriod = period/4;
@@ -1668,10 +1777,10 @@ uint32_t i2cGetFrequency(i2c_t * i2c)
 }
 
 
-uint32_t i2cDebug(i2c_t * i2c, uint32_t setBits, uint32_t resetBits){
-    if(i2c != NULL) {
-        i2c->debugFlags = ((i2c->debugFlags | setBits) & ~resetBits);
-        return i2c->debugFlags;
+uint32_t i2cDebug(i2c_queue_t * inQb, uint32_t setBits, uint32_t resetBits){
+    if(inQb != NULL) {
+        inQb->debugFlags = ((inQb->debugFlags | setBits) & ~resetBits);
+        return inQb->debugFlags;
     }
     return 0;
     
@@ -1683,6 +1792,53 @@ uint32_t i2cGetStatus(i2c_t * i2c){
     }
     else return 0;
 }
+
+i2c_err_t i2cGetLock(i2c_t * i2c, i2c_queue_t * inQb, uint16_t timeOutMillis, uint32_t * count){
+#if !CONFIG_DISABLE_HAL_LOCKS
+    if(!i2c){
+        return I2C_ERROR_DEV;
+    }
+    if(xSemaphoreTakeRecursive(i2c->lock, timeOutMillis / portTICK_PERIOD_MS)==pdTRUE) {
+//        log_i("+");
+        i2c->lockCount++;
+        if(count) *count = i2c->lockCount;
+        return I2C_ERROR_OK;
+    } else {
+        log_e(" Fail to lock, count=%d",i2c->lockCount);
+        if(count) *count = i2c->lockCount;
+        return I2C_ERROR_TIMEOUT;
+    }
+#else
+    if(count) *count = 0;
+    return I2C_ERROR_OK;
+#endif
+}
+
+i2c_err_t i2cReleaseLock(i2c_t * i2c, i2c_queue_t * inQb, uint32_t * count){
+#if !CONFIG_DISABLE_HAL_LOCKS
+    if(!i2c){
+        return I2C_ERROR_DEV;
+    }
+    i2c->lockCount--;
+    uint32_t tempCount = i2c->lockCount;
+    if (xSemaphoreGiveRecursive(i2c->lock)==pdTRUE){ ; 
+//        log_i("-");
+
+        if(count) *count = tempCount;
+        return I2C_ERROR_OK;
+    } else {
+        i2c->lockCount++;
+        log_e(" Fail to unlock, count=%d",i2c->lockCount);
+        if(count) *count = i2c->lockCount;
+        return I2C_ERROR_TIMEOUT;
+    }
+#else
+    if(count) *count = 0;
+    return I2C_ERROR_OK;
+#endif 
+}
+
+
 /* todo
   22JUL18
     need to add multi-thread capability, use dq.queueEvent as the group marker. When multiple threads
@@ -1690,5 +1846,6 @@ uint32_t i2cGetStatus(i2c_t * i2c){
     with the same dq.queueEvent value.  Succeeding unserviced transactions with different dq.queueEvent values
     can be re-queued and processed independently. 
   30JUL18 complete data only queue elements, this will allow transfers to use multiple data blocks, 
- */
+  08DEC18 adding multiThread capability
+  */
 

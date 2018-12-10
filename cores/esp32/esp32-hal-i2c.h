@@ -28,53 +28,51 @@ extern "C" {
 // External Wire.h equivalent error Codes
 typedef enum {
     I2C_ERROR_OK=0,
-    I2C_ERROR_DEV,
-    I2C_ERROR_ACK,
-    I2C_ERROR_TIMEOUT,
-    I2C_ERROR_BUS,
-    I2C_ERROR_BUSY,
-    I2C_ERROR_MEMORY,
-    I2C_ERROR_CONTINUE,
-    I2C_ERROR_NO_BEGIN
+    I2C_ERROR_DEV,      // hardware fault, interrupt allocation error, pin configuration error, pin State error, i2c==NULL
+    I2C_ERROR_ACK,      // Slave device did not acknowledge
+    I2C_ERROR_TIMEOUT,  // SCL stretching exceeded time out, Lock Acquire time out 
+    I2C_ERROR_BUS,      // Arbitration failure
+    I2C_ERROR_BUSY,     // bus is inuse by other Master
+    I2C_ERROR_MEMORY,   // Heap allocation  error, Semaphore creation error
+    I2C_ERROR_CONTINUE, // ReSTART transaction queued, will not execute until STOP issued.
+    I2C_ERROR_NO_BEGIN  // Not used by hal-i2c, just TwoWire()
 } i2c_err_t;
 
 struct i2c_struct_t;
 typedef struct i2c_struct_t i2c_t;
 
-i2c_t * i2cInit(uint8_t i2c_num, int8_t sda, int8_t scl, uint32_t clk_speed);
-void i2cRelease(i2c_t *i2c); // free ISR, Free DQ, Power off peripheral clock.  Must call i2cInit() to recover
-i2c_err_t i2cWrite(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis);
-i2c_err_t i2cRead(i2c_t * i2c, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis, uint32_t *readCount);
-i2c_err_t i2cFlush(i2c_t *i2c);
+struct i2c_queue_block_t;
+typedef struct i2c_queue_block_t i2c_queue_t;
+
+i2c_err_t i2cInit(int8_t sda, int8_t scl, uint32_t clk_speed, i2c_queue_t ** Qb, i2c_t ** I2c);
+void i2cRelease(i2c_t *i2c, i2c_queue_t ** inQb); // free ISR, Free DQ, Power off peripheral clock.  Must call i2cInit() to recover
+i2c_err_t i2cWrite(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis);
+i2c_err_t i2cRead(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis, uint32_t *readCount);
+i2c_err_t i2cFlush(i2c_t *i2c, i2c_queue_t * inQb );
 i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed);
 uint32_t i2cGetFrequency(i2c_t * i2c);
 uint32_t i2cGetStatus(i2c_t * i2c); // Status register of peripheral
-
-//Functions below should be used only if well understood
-//Might be deprecated and removed in future
-i2c_err_t i2cAttachSCL(i2c_t * i2c, int8_t scl);
-i2c_err_t i2cDetachSCL(i2c_t * i2c, int8_t scl);
-i2c_err_t i2cAttachSDA(i2c_t * i2c, int8_t sda);
-i2c_err_t i2cDetachSDA(i2c_t * i2c, int8_t sda);
-
-//Stickbreakers ISR Support
-i2c_err_t i2cProcQueue(i2c_t *i2c, uint32_t *readCount, uint16_t timeOutMillis);
-i2c_err_t i2cAddQueueWrite(i2c_t *i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen, bool SendStop, EventGroupHandle_t event);
-i2c_err_t i2cAddQueueRead(i2c_t *i2c, uint16_t i2cDeviceAddr, uint8_t *dataPtr, uint16_t dataLen, bool SendStop, EventGroupHandle_t event);
+i2c_err_t i2cGetLock(i2c_t * i2c, i2c_queue_t * inQb, uint16_t timeOutMillis, uint32_t * count);
+i2c_err_t i2cReleaseLock(i2c_t * i2c, i2c_queue_t * inQb, uint32_t * count);
 
 //stickbreaker debug support
-uint32_t i2cDebug(i2c_t *, uint32_t setBits, uint32_t resetBits);
-//  Debug actions have 3 currently defined locus 
-// 0xXX------ : at entry of ProcQueue 
-// 0x--XX---- : at exit of ProcQueue
-// 0x------XX : at entry of Flush
-// 
-// bit 0 causes DumpI2c to execute 
-// bit 1 causes DumpInts to execute
-// bit 2 causes DumpCmdqueue to execute
-// bit 3 causes DumpStatus to execute
-// bit 4 causes DumpFifo to execute
+uint32_t i2cDebug(i2c_queue_t * inQb, uint32_t setBits, uint32_t resetBits);
+/*  Debug actions have 3 currently defined locus 
+ 0xXX------ : at entry of ProcQueue 
+ 0x--XX---- : at exit of ProcQueue
+ 0x------XX : at entry of Flush
+ 
+ bit 0 causes DumpI2c to execute 
+ bit 1 causes DumpInts to execute
+ bit 2 causes DumpCmdqueue to execute
+ bit 3 causes DumpStatus to execute
+ bit 4 causes DumpFifo to execute
 
+ To enable debug:
+  * at line 45 of esp32-hal-i2c.c, ENABLE_I2C_DEBUG_BUFFER must be defined. 
+  * Core Level Debug must be >= INFO
+
+ */
 #ifdef __cplusplus
 }
 #endif
