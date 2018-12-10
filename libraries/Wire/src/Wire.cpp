@@ -103,7 +103,7 @@ bool TwoWire::begin(int sdaPin, int sclPin, uint32_t frequency)
     }
     
     if( frequency == 0){ // reuse existing frequency
-        }
+ 
     } else if((frequency <10000)||(frequency > 2000000)) {
         _freq = 100000;
     } else {
@@ -136,12 +136,17 @@ uint16_t TwoWire::getTimeOut()
 
 void TwoWire::setClock(uint32_t frequency)
 {
-    i2cSetFrequency(i2c, frequency);
+  if((frequency < 10000) ||(frequency > 2000000)){
+    _freq = 100000;
+  } else _freq = frequency;
+  if(i2cQ){
+    i2cSetFrequency(i2cQ, _freq);
+  }
 }
 
 size_t TwoWire::getClock()
 {
-    return i2cGetFrequency(i2c);
+    return _freq;
 }
 
 /* stickBreaker Nov 2017 ISR, and bigblock 64k-1

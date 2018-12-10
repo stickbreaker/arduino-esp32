@@ -28,7 +28,7 @@ extern "C" {
 // External Wire.h equivalent error Codes
 typedef enum {
     I2C_ERROR_OK=0,
-    I2C_ERROR_DEV,      // hardware fault, interrupt allocation error, pin configuration error, pin State error, i2c==NULL
+    I2C_ERROR_DEV,      // hardware fault, interrupt allocation error, configuration error, pin State error, i2c==NULL
     I2C_ERROR_ACK,      // Slave device did not acknowledge
     I2C_ERROR_TIMEOUT,  // SCL stretching exceeded time out, Lock Acquire time out 
     I2C_ERROR_BUS,      // Arbitration failure
@@ -49,8 +49,8 @@ void i2cRelease(i2c_t *i2c, i2c_queue_t ** inQb); // free ISR, Free DQ, Power of
 i2c_err_t i2cWrite(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis);
 i2c_err_t i2cRead(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* buff, uint16_t size, bool sendStop, uint16_t timeOutMillis, uint32_t *readCount);
 i2c_err_t i2cFlush(i2c_t *i2c, i2c_queue_t * inQb );
-i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed);
-uint32_t i2cGetFrequency(i2c_t * i2c);
+i2c_err_t i2cSetFrequency(i2c_queue_t * inQb, uint32_t clk_speed);
+uint32_t i2cGetFrequency(i2c_queue_t * inQb);
 uint32_t i2cGetStatus(i2c_t * i2c); // Status register of peripheral
 i2c_err_t i2cGetLock(i2c_t * i2c, i2c_queue_t * inQb, uint16_t timeOutMillis, uint32_t * count);
 i2c_err_t i2cReleaseLock(i2c_t * i2c, i2c_queue_t * inQb, uint32_t * count);

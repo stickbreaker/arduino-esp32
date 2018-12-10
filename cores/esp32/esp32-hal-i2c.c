@@ -1164,7 +1164,7 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, i2c_queue_t * inQb, uint32_t *readCount, uin
     i2c_err_t reason = I2C_ERROR_OK;
     i2c->mode = I2C_MASTER;
     i2c->dev->ctr.trans_start=0; // Pause Machine
-    i2cSetFrequency(i2c, i2c->qb->clockFreq);
+    i2cConfigureFrequency(i2c, i2c->qb->clockFreq);
 
     i2c->dev->timeout.tout = 0xFFFFF; // max 13ms
     i2c->dev->int_clr.val = 0x1FFF; // kill them All!
@@ -1240,7 +1240,7 @@ i2c_err_t i2cProcQueue(i2c_t * i2c, i2c_queue_t * inQb, uint32_t *readCount, uin
     // how many ticks should it take to transfer totalBytes through the I2C hardware,
     // add user supplied timeOutMillis to Calculated Value
 
-    portTickType ticksTimeOut = ((totalBytes*10*1000)/(i2cGetFrequency(i2c))+timeOutMillis)/portTICK_PERIOD_MS;
+    portTickType ticksTimeOut = ((totalBytes*10*1000)/(i2c->qb->clockFreq)+timeOutMillis)/portTICK_PERIOD_MS;
 
     i2c->dev->ctr.trans_start=1; // go for it
 
@@ -1548,7 +1548,7 @@ i2c_err_t i2cInit(int8_t sda, int8_t scl, uint32_t frequency, i2c_queue_t ** inQ
             memset(*inQb,0,sizeof(i2c_queue_t));
         }
         (*inQb)->clockFreq = frequency;
-        i2cSetFrequency(i2c, (*inQb)->clockFreq);
+        i2cConfigureFrequency(i2c, (*inQb)->clockFreq);
         
         if(!i2cCheckLineState(sda, scl)){
             log_e("bad pin state");
@@ -1714,7 +1714,18 @@ i2c_err_t i2cRead(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* bu
     return last_error;
 }
 
-i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed)
+i2c_err_t i2cSetFrequency(i2cq_t * inQb, uint32_t clock_speed){
+    if(inQb == NULL){
+        return I2C_ERROR_DEV;
+    }
+    if(clock_speed<10000) || (clock_speed>2000000)){
+        clock_speed = 100000; // default
+    }
+    inQb->clockFreq = clock_speed;  
+    return I2C_ERROR_OK;
+}
+
+static i2c_err_t i2cConfigureFrequency(i2c_t * i2c, uint32_t clk_speed)
 {
     if(i2c == NULL) {
         return I2C_ERROR_DEV;
@@ -1761,12 +1772,15 @@ i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed)
     return I2C_ERROR_OK;
 }
 
-uint32_t i2cGetFrequency(i2c_t * i2c)
+uint32_t i2cGetFrequency(i2c_queue_t * inQb)
 {
-    if(i2c == NULL) {
+    if(inQb == NULL) {
         return 0;
     }
-    uint32_t result = 0;
+ 
+    return inQb->clockFreq;
+ /*   
+
     uint32_t old_count = (i2c->dev->scl_low_period.period+i2c->dev->scl_high_period.period);
     if(old_count>0) {
         result = APB_CLK_FREQ / old_count;
@@ -1774,6 +1788,7 @@ uint32_t i2cGetFrequency(i2c_t * i2c)
         result = 0;
     }
     return result;
+    */
 }
 
 
@@ -1848,4 +1863,3 @@ i2c_err_t i2cReleaseLock(i2c_t * i2c, i2c_queue_t * inQb, uint32_t * count){
   30JUL18 complete data only queue elements, this will allow transfers to use multiple data blocks, 
   08DEC18 adding multiThread capability
   */
-
