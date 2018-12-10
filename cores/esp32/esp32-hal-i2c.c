@@ -234,7 +234,13 @@ static i2c_t _i2c_bus_array[2] = {
  * */
 
 
-/* Stickbreaker ISR mode debug support
+ /* Forwards
+*/ 
+
+ static i2c_err_t i2cConfigureFrequency(i2c_t * i2c, uint32_t clk_speed);
+
+/* Debug support
+
  */
 static void IRAM_ATTR i2cDumpCmdQueue(i2c_t *i2c)
 {
@@ -1714,11 +1720,11 @@ i2c_err_t i2cRead(i2c_t * i2c, i2c_queue_t * inQb, uint16_t address, uint8_t* bu
     return last_error;
 }
 
-i2c_err_t i2cSetFrequency(i2cq_t * inQb, uint32_t clock_speed){
+i2c_err_t i2cSetFrequency(i2c_queue_t * inQb, uint32_t clock_speed){
     if(inQb == NULL){
         return I2C_ERROR_DEV;
     }
-    if(clock_speed<10000) || (clock_speed>2000000)){
+    if((clock_speed<10000) || (clock_speed>2000000)){
         clock_speed = 100000; // default
     }
     inQb->clockFreq = clock_speed;  
