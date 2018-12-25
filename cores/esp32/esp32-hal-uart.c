@@ -45,6 +45,8 @@ struct uart_struct_t {
     uint8_t num;
     xQueueHandle queue;
     intr_handle_t intr_handle;
+    int8_t rx_pin;
+    bool invertedLogic;
 };
 
 #if CONFIG_DISABLE_HAL_LOCKS
@@ -52,55 +54,83 @@ struct uart_struct_t {
 #define UART_MUTEX_UNLOCK()
 
 static uart_t _uart_bus_array[3] = {
-    {(volatile uart_dev_t *)(DR_REG_UART_BASE), 0, NULL, NULL},
-    {(volatile uart_dev_t *)(DR_REG_UART1_BASE), 1, NULL, NULL},
-    {(volatile uart_dev_t *)(DR_REG_UART2_BASE), 2, NULL, NULL}
+    {(volatile uart_dev_t *)(DR_REG_UART_BASE), 0, NULL, NULL,-1,false},
+    {(volatile uart_dev_t *)(DR_REG_UART1_BASE), 1, NULL, NULL,-1,false},
+    {(volatile uart_dev_t *)(DR_REG_UART2_BASE), 2, NULL, NULL,-1,false}
 };
 #else
-#define UART_MUTEX_LOCK()    do {} while (xSemaphoreTake(uart->lock, portMAX_DELAY) != pdPASS)
-#define UART_MUTEX_UNLOCK()  xSemaphoreGive(uart->lock)
+#define UART_MUTEX_LOCK()    do {} while (xSemaphoreTakeRecursive(uart->lock, portMAX_DELAY) != pdPASS)
+#define UART_MUTEX_UNLOCK()  xSemaphoreGiveRecursive(uart->lock)
 
 static uart_t _uart_bus_array[3] = {
-    {(volatile uart_dev_t *)(DR_REG_UART_BASE), NULL, 0, NULL, NULL},
-    {(volatile uart_dev_t *)(DR_REG_UART1_BASE), NULL, 1, NULL, NULL},
-    {(volatile uart_dev_t *)(DR_REG_UART2_BASE), NULL, 2, NULL, NULL}
+    {(volatile uart_dev_t *)(DR_REG_UART_BASE), NULL, 0, NULL, NULL,-1,false},
+    {(volatile uart_dev_t *)(DR_REG_UART1_BASE), NULL, 1, NULL, NULL,-1,false},
+    {(volatile uart_dev_t *)(DR_REG_UART2_BASE), NULL, 2, NULL, NULL,-1,false}
 };
 #endif
 
-static void _uart_rx_flush( uart_t * uart){
+//#define DEBUG_RX
+
+
+static void _uart_rx_read_fifo( uart_t * uart){
     uint8_t c;
     UART_MUTEX_LOCK();
-    UBaseType_t spaces=0;
+    UBaseType_t count=0, spaces=0;
+    // wr_addr, rd_addr are circular buffer pointers, wrapping is controlled by UART config,
+    // standard fifo is 128 byte, but address is 11bits (1024byte buffer, allocated into 6 128byte buffers rx/tx)
+    
+    count = (uart->dev->mem_rx_status.wr_addr - uart->dev->mem_rx_status.rd_addr)% 0x80;
     if(uart->queue != NULL) {
         spaces=uxQueueSpacesAvailable( uart->queue);
+    
+        while((spaces >0)&&(count-- > 0)){
+        //(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr))) {
+            c = uart->dev->fifo.rw_byte;
+            xQueueSend(uart->queue, &c,0);
+            spaces--;
+        }
+    }  
+    if(spaces == 0){ // disable rxFifo_full interrupt, no room in Queue or queue does not exit
+        uart->dev->int_ena.rxfifo_full = 0;
+        uart->dev->int_ena.rxfifo_tout = 0;
+#ifdef DEBUG_RX
+        digitalWrite(25,HIGH);
+#endif
     }
-    while(((spaces--) >0)&&(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr))) {
-        c = uart->dev->fifo.rw_byte;
-        xQueueSend(uart->queue, &c,0);
-    }
-	UART_MUTEX_UNLOCK();
+    UART_MUTEX_UNLOCK();
 }
 
 static void IRAM_ATTR _uart_isr(void *arg)
 {
-    uint8_t i,c;
-    BaseType_t xHigherPriorityTaskWoken;
-    uart_t* uart;
-
-    for(i=0;i<3;i++){
-        uart = &_uart_bus_array[i];
-        if(uart->intr_handle == NULL){
-            continue;
+    uint8_t i, c;
+    BaseType_t xHigherPriorityTaskWoken=pdFALSE;
+    uart_t* uart =(uart_t *)arg;
+    if( uart != NULL){
+        UBaseType_t spaces=0,count=0;
+        count = (uart->dev->mem_rx_status.wr_addr - uart->dev->mem_rx_status.rd_addr)%0x80;
+        if(uart->queue != NULL) {
+            spaces=uxQueueSpacesAvailable( uart->queue);
+        
+     
+            while((spaces > 0 )&&( (count--) > 0 )){ // if room in queue move from fifo to queue
+          // store it
+                c = uart->dev->fifo.rw_byte;
+                xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+                spaces--;
+            }
         }
-		while(uart->dev->status.rxfifo_cnt || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
-        	c = uart->dev->fifo.rw_byte;
-        	if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
-            	xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
-        	}
+
+        if(spaces==0) { // disable interrupts until space exists in queue
+        // if fifo overflows then, characters are lost.  But which characters? top of fifo or bottom?
+           uart->dev->int_ena.rxfifo_full = 0;
+           uart->dev->int_ena.rxfifo_tout = 0;
+#ifdef DEBUG_RX
+           digitalWrite(25,HIGH);
+#endif
+        }
         uart->dev->int_clr.rxfifo_full = 1;
         uart->dev->int_clr.frm_err = 1;
         uart->dev->int_clr.rxfifo_tout = 1;
-    	}
     }
 
     if (xHigherPriorityTaskWoken) {
@@ -108,7 +138,7 @@ static void IRAM_ATTR _uart_isr(void *arg)
     }
 }
 
-void uartEnableInterrupt(uart_t* uart)
+static void uartEnableInterrupt(uart_t* uart)
 {
     UART_MUTEX_LOCK();
     uart->dev->conf1.rxfifo_full_thrhd = 112; // needs speed compensation?
@@ -118,12 +148,22 @@ void uartEnableInterrupt(uart_t* uart)
     uart->dev->int_ena.frm_err = 1;
     uart->dev->int_ena.rxfifo_tout = 1;
     uart->dev->int_clr.val = 0xffffffff;
+#ifdef DEBUG_RX
+    digitalWrite(25,LOW);
+#endif
 // can this share an interrupt?
-    esp_intr_alloc(UART_INTR_SOURCE(uart->num), (int)ESP_INTR_FLAG_IRAM, _uart_isr, NULL, &uart->intr_handle);
+    uint32_t flags = ESP_INTR_FLAG_IRAM | ESP_INTR_FLAG_SHARED | ESP_INTR_FLAG_LOWMED;
+//    esp_intr_alloc(UART_INTR_SOURCE(uart->num), (int)ESP_INTR_FLAG_IRAM, _uart_isr, uart, &uart->intr_handle);
+    uint32_t ret = 0;
+    uint32_t interrupts_enabled = uart->dev->int_ena.val;
+    ret = esp_intr_alloc_intrstatus(UART_INTR_SOURCE(uart->num), flags, (uint32_t)&uart->dev->int_st.val, interrupts_enabled, _uart_isr,uart, &uart->intr_handle);
+    if(ret != ESP_OK ){
+        log_e("unable to configure interrupt %u",ret);
+    }
     UART_MUTEX_UNLOCK();
 }
 
-void uartDisableInterrupt(uart_t* uart)
+static void uartDisableInterrupt(uart_t* uart)
 {
     UART_MUTEX_LOCK();
     uart->dev->conf1.val = 0;
@@ -136,16 +176,17 @@ void uartDisableInterrupt(uart_t* uart)
     UART_MUTEX_UNLOCK();
 }
 
-void uartDetachRx(uart_t* uart)
+static void uartDetachRx(uart_t* uart)
 {
     if(uart == NULL) {
         return;
     }
     pinMatrixInDetach(UART_RXD_IDX(uart->num), false, false);
     uartDisableInterrupt(uart);
+    uart->rx_pin = -1;
 }
 
-void uartDetachTx(uart_t* uart)
+static void uartDetachTx(uart_t* uart)
 {
     if(uart == NULL) {
         return;
@@ -153,17 +194,18 @@ void uartDetachTx(uart_t* uart)
     pinMatrixOutDetach(UART_TXD_IDX(uart->num), false, false);
 }
 
-void uartAttachRx(uart_t* uart, uint8_t rxPin, bool inverted)
+static void uartAttachRx(uart_t* uart, uint8_t rxPin, bool inverted)
 {
     if(uart == NULL || rxPin > 39) {
         return;
     }
-    pinMode(rxPin, INPUT);
+    uart->rx_pin = rxPin;
+    pinMode(rxPin, INPUT_PULLUP);
     pinMatrixInAttach(rxPin, UART_RXD_IDX(uart->num), inverted);
     uartEnableInterrupt(uart);
 }
 
-void uartAttachTx(uart_t* uart, uint8_t txPin, bool inverted)
+static void uartAttachTx(uart_t* uart, uint8_t txPin, bool inverted)
 {
     if(uart == NULL || txPin > 39) {
         return;
@@ -186,12 +228,14 @@ uart_t* uartBegin(uint8_t uart_nr, uint32_t baudrate, uint32_t config, int8_t rx
 
 #if !CONFIG_DISABLE_HAL_LOCKS
     if(uart->lock == NULL) {
-        uart->lock = xSemaphoreCreateMutex();
+        uart->lock = xSemaphoreCreateRecursiveMutex();
         if(uart->lock == NULL) {
             return NULL;
         }
     }
 #endif
+    UART_MUTEX_LOCK();
+    uart->invertedLogic = inverted;
 
     if(queueLen && uart->queue == NULL) {
         uart->queue = xQueueCreate(queueLen, sizeof(uint8_t)); //initialize the queue
@@ -199,6 +243,9 @@ uart_t* uartBegin(uint8_t uart_nr, uint32_t baudrate, uint32_t config, int8_t rx
             return NULL;
         }
     }
+    uartDetachRx(uart); // release ISR
+    uartDetachTx(uart);
+    
     if(uart_nr == 1){
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART1_RST);
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART1_CLK_EN);
@@ -212,10 +259,10 @@ uart_t* uartBegin(uint8_t uart_nr, uint32_t baudrate, uint32_t config, int8_t rx
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART_CLK_EN);
         DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART_RST);
     }
-    uartFlush(uart);
     uartSetBaudRate(uart, baudrate);
-    UART_MUTEX_LOCK();
     uart->dev->conf0.val = config;
+    uart->dev->mem_conf.mem_pd=0; // power up Fifo memory
+    uartFlush(uart);
     #define TWO_STOP_BITS_CONF 0x3
     #define ONE_STOP_BITS_CONF 0x1
 
@@ -223,15 +270,16 @@ uart_t* uartBegin(uint8_t uart_nr, uint32_t baudrate, uint32_t config, int8_t rx
         uart->dev->conf0.stop_bit_num = ONE_STOP_BITS_CONF;
         uart->dev->rs485_conf.dl1_en = 1;
     }
-    UART_MUTEX_UNLOCK();
-
-    if(rxPin != -1) {
-        uartAttachRx(uart, rxPin, inverted);
-    }
 
     if(txPin != -1) {
         uartAttachTx(uart, txPin, inverted);
     }
+
+    if(rxPin != -1) {
+        uartAttachRx(uart, rxPin, inverted); //Attach ISR interrupt also
+    }
+
+    UART_MUTEX_UNLOCK();
 
     return uart;
 }
@@ -242,13 +290,15 @@ void uartEnd(uart_t* uart)
         return;
     }
 
+    UART_MUTEX_LOCK();
+
     uartDetachRx(uart); // release pin, disable interrupt
     uartDetachTx(uart); // release pin
 
-    UART_MUTEX_LOCK();
 
     uart->dev->conf0.val = 0;
     // power down uart, disable clocking
+    uart->dev->mem_conf.mem_pd=1; // power down Fifo memory
     if(uart->num == 1){
         DPORT_SET_PERI_REG_MASK(DPORT_PERIP_RST_EN_REG, DPORT_UART1_RST);
         DPORT_CLEAR_PERI_REG_MASK(DPORT_PERIP_CLK_EN_REG, DPORT_UART1_CLK_EN);
@@ -277,13 +327,27 @@ size_t uartResizeRxBuffer(uart_t * uart, size_t new_size) {
 
     UART_MUTEX_LOCK();
     if(uart->queue != NULL) {
+        uart->dev->int_ena.rxfifo_full = 0; // shut off interrupt
+        uart->dev->int_ena.rxfifo_tout = 0;
+#ifdef DEBUG_RX
+        digitalWrite(25,HIGH);
+#endif
         uint8_t c;
         while(xQueueReceive(uart->queue, &c, 0));
         vQueueDelete(uart->queue);
+    }
+    if( new_size > 0){
         uart->queue = xQueueCreate(new_size, sizeof(uint8_t));
         if(uart->queue == NULL) {
             return NULL;
+        } else { // reEnable interrupt
+            uart->dev->int_ena.rxfifo_full = 1;
+            uart->dev->int_ena.rxfifo_tout = 1;
+#ifdef DEBUG_RX
+            digitalWrite(25,LOW);
+#endif
         }
+    
     }
     UART_MUTEX_UNLOCK();
 
@@ -292,11 +356,19 @@ size_t uartResizeRxBuffer(uart_t * uart, size_t new_size) {
 
 uint32_t uartAvailable(uart_t* uart)
 {
-    if(uart == NULL || uart->queue == NULL) {
+    if(uart == NULL ){
         return 0;
     }
-    _uart_rx_flush(uart);
-    return uxQueueMessagesWaiting(uart->queue);
+    UART_MUTEX_LOCK();
+    uin32_t count = 0;
+    if(uart->queue){
+        _uart_rx_read_fifo(uart);
+        count = uxQueueMessagesWaiting(uart->queue);
+    }
+    // include direct from FiFo
+    count += (uart->dev->mem_rx_status.wr_addr - uart->dev->mem_rx_status.rd_addr)% 0x80;
+    UART_MUTEX_UNLOCK();
+    return count;
 }
 
 uint32_t uartAvailableForWrite(uart_t* uart)
@@ -307,38 +379,50 @@ uint32_t uartAvailableForWrite(uart_t* uart)
     return 0x7f - uart->dev->status.txfifo_cnt;
 }
 
-uint8_t uartRead(uart_t* uart)
+int16_t uartRead(uart_t* uart)
 {
-    if(uart == NULL || uart->queue == NULL) {
-        return 0;
+    if(uart == NULL ) {
+        return -1;
     }
     uint8_t c;
-    if(xQueueReceive(uart->queue, &c, 0)) {
-        return c;
-    } else {
-        _uart_rx_flush(uart);
+    uart->dev->int_ena.rxfifo_full = 1;
+    uart->dev->int_ena.rxfifo_tout = 1;
+#ifdef DEBUG_RX
+    digitalWrite(25,LOW);
+#endif
+    if(uart->queue != NULL){
         if(xQueueReceive(uart->queue, &c, 0)) {
+            return c;
+        } else {
+            _uart_rx_read_fifo(uart);
+            if(xQueueReceive(uart->queue, &c, 0)) {
+                return c;
+            }
+        }
+    } else { // direct from fifo
+        if( ((uart->dev->mem_rx_status.wr_addr - uart->dev->mem_rx_status.rd_addr)% 0x80)>0){
+            c = uart->dev->fifo.rw_byte;
             return c;
         }
     }
-    return 0;
+    return -1;
 }
 
-uint8_t uartPeek(uart_t* uart)
+int16_t uartPeek(uart_t* uart) // peek cannot work without Queue
 {
     if(uart == NULL || uart->queue == NULL) {
-        return 0;
+        return -1;
     }
     uint8_t c;
     if(xQueuePeek(uart->queue, &c, 0)) {
         return c;
     } else {
-        _uart_rx_flush(uart);
-        if(xQueueReceive(uart->queue, &c, 0)) {
+        _uart_rx_read_fifo(uart);
+        if(xQueuePeek(uart->queue, &c, 0)) {
             return c;
         }
     }
-    return 0;
+    return -1;
 }
 
 void uartWrite(uart_t* uart, uint8_t c)
@@ -346,8 +430,12 @@ void uartWrite(uart_t* uart, uint8_t c)
     if(uart == NULL) {
         return;
     }
+    
     UART_MUTEX_LOCK();
-    while(uart->dev->status.txfifo_cnt == 0x7F);
+    while(uart->dev->status.txfifo_cnt == 0x7F){
+      digitalWrite(25,HIGH);
+    }
+    digitalWrite(25,LOW);
     uart->dev->fifo.rw_byte = c;
     UART_MUTEX_UNLOCK();
 }
@@ -363,7 +451,9 @@ void uartWriteBuf(uart_t* uart, const uint8_t * data, size_t len)
             uart->dev->fifo.rw_byte = *data++;
             len--;
         }
+        if (len) digitalWrite(25,HIGH);
     }
+    digitalWrite(25,LOW);
     UART_MUTEX_UNLOCK();
 }
 
@@ -380,6 +470,7 @@ void uartFlush(uart_t* uart)
     //See description about UART_TXFIFO_RST and UART_RXFIFO_RST in <<esp32_technical_reference_manual>> v2.6 or later.
 
     // we read the data out and make `fifo_len == 0 && rd_addr == wr_addr`.
+
     while(uart->dev->status.rxfifo_cnt != 0 || (uart->dev->mem_rx_status.wr_addr != uart->dev->mem_rx_status.rd_addr)) {
         READ_PERI_REG(UART_FIFO_REG(uart->num));
     }
@@ -387,15 +478,39 @@ void uartFlush(uart_t* uart)
     UART_MUTEX_UNLOCK();
 }
 
+void uartDrain(uart_t * uart)
+{
+    if(uart == NULL) {
+        return;
+    }
+
+    UART_MUTEX_LOCK(); 
+    //wait for txFifo to empty
+    while(uart->dev->status.txfifo_cnt || uart->dev->status.st_utx_out){
+        digitalWrite(25,HIGH);
+    }
+    digitalWrite(25,LOW);
+    //empty rxFifo, save rx characters so reset of UART doesn't cause problem
+    _uart_rx_read_fifo(uart);
+
+    UART_MUTEX_UNLOCK();
+}
+  
+
 void uartSetBaudRate(uart_t* uart, uint32_t baud_rate)
 {
     if(uart == NULL) {
         return;
     }
     UART_MUTEX_LOCK();
-    uint32_t clk_div = ((UART_CLK_FREQ<<4)/baud_rate);
+    int8_t oldPin = uart->rx_pin;
+    uartDetachRx(uart);  // detach RX pin
+    uartDrain(uart); // empty tx,rxFifo
+    // attach RX pin
+    uint32_t clk_div = ((getApbFrequency()<<4)/baud_rate);
     uart->dev->clk_div.div_int = clk_div>>4 ;
     uart->dev->clk_div.div_frag = clk_div & 0xf;
+    uartAttachRx(uart,oldPin,uart->invertedLogic);
     UART_MUTEX_UNLOCK();
 }
 
@@ -405,7 +520,7 @@ uint32_t uartGetBaudRate(uart_t* uart)
         return 0;
     }
     uint32_t clk_div = (uart->dev->clk_div.div_int << 4) | (uart->dev->clk_div.div_frag & 0x0F);
-    return ((UART_CLK_FREQ<<4)/clk_div);
+    return ((getApbFrequency()<<4)/clk_div);
 }
 
 static void IRAM_ATTR uart0_write_char(char c)
@@ -481,9 +596,9 @@ int log_printf(const char *format, ...)
     vsnprintf(temp, len+1, format, arg);
 #if !CONFIG_DISABLE_HAL_LOCKS
     if(_uart_bus_array[s_uart_debug_nr].lock){
-        while (xSemaphoreTake(_uart_bus_array[s_uart_debug_nr].lock, portMAX_DELAY) != pdPASS);
+        while (xSemaphoreTakeRecursive(_uart_bus_array[s_uart_debug_nr].lock, portMAX_DELAY) != pdPASS);
         ets_printf("%s", temp);
-        xSemaphoreGive(_uart_bus_array[s_uart_debug_nr].lock);
+        xSemaphoreGiveRecursive(_uart_bus_array[s_uart_debug_nr].lock);
     } else {
         ets_printf("%s", temp);
     }
@@ -491,7 +606,7 @@ int log_printf(const char *format, ...)
     ets_printf("%s", temp);
 #endif
     va_end(arg);
-    if(len > 64){
+    if(len >= sizeof(loc_buf)){
         free(temp);
     }
     return len;
@@ -540,7 +655,7 @@ uartDetectBaudrate(uart_t *uart)
     uart->dev->auto_baud.en = 0;
     uartStateDetectingBaudrate = false; // Initialize for the next round
 
-    unsigned long baudrate = UART_CLK_FREQ / divisor;
+    unsigned long baudrate = getApbFrequency() / divisor;
 
     static const unsigned long default_rates[] = {300, 600, 1200, 2400, 4800, 9600, 19200, 38400, 57600, 74880, 115200, 230400, 256000, 460800, 921600, 1843200, 3686400};
 

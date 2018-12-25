@@ -28,7 +28,7 @@ HardwareSerial Serial1(1);
 HardwareSerial Serial2(2);
 #endif
 
-HardwareSerial::HardwareSerial(int uart_nr) : _uart_nr(uart_nr), _uart(NULL) {}
+HardwareSerial::HardwareSerial(int uart_nr) : _uart_nr(uart_nr), _uart(NULL), _baud(0), _rx_pin(-1), _tx_pin(-1) {}
 
 void HardwareSerial::begin(unsigned long baud, uint32_t config, int8_t rxPin, int8_t txPin, bool invert, unsigned long timeout_ms)
 {
@@ -52,23 +52,29 @@ void HardwareSerial::begin(unsigned long baud, uint32_t config, int8_t rxPin, in
         txPin = TX2;
     }
 
-    _uart = uartBegin(_uart_nr, baud ? baud : 9600, config, rxPin, txPin, 256, invert);
+    if((_uart != NULL)&&(rxPin == _rx_pin)&&( txPin == _tx_pin)&&(baud !=0)){ // just change baud rate, 
+        uartSetBaudRate(_uart,baud);
+        log_i("begin set baud only");
+    } else { // completely reconfigure
+        _uart = uartBegin(_uart_nr, baud ? baud : 9600, config, rxPin, txPin, 256, invert);
+ //       log_i("Init Uart[%d] baud=%d, rx=%d, tx=%d",_uart_nr,baud,rxPin,txPin);
+        
+        if(!baud) {
+            time_t startMillis = millis();
+            unsigned long detectedBaudRate = 0;
+            while(millis() - startMillis < timeout_ms && !(detectedBaudRate = uartDetectBaudrate(_uart))) {
+                yield();
+            }
 
-    if(!baud) {
-        time_t startMillis = millis();
-        unsigned long detectedBaudRate = 0;
-        while(millis() - startMillis < timeout_ms && !(detectedBaudRate = uartDetectBaudrate(_uart))) {
-            yield();
-        }
+            end();
 
-        end();
-
-        if(detectedBaudRate) {
-            delay(100); // Give some time...
-            _uart = uartBegin(_uart_nr, detectedBaudRate, config, rxPin, txPin, 256, invert);
-        } else {
-            log_e("Could not detect baudrate. Serial data at the port must be present within the timeout for detection to be possible");
-            _uart = NULL;
+            if(detectedBaudRate) {
+                delay(100); // Give some time...
+                _uart = uartBegin(_uart_nr, detectedBaudRate, config, rxPin, txPin, 256, invert);
+            } else {
+                log_e("Could not detect baudrate. Serial data at the port must be present within the timeout for detection to be possible");
+                _uart = NULL;
+            }
         }
     }
 }
@@ -79,7 +85,7 @@ void HardwareSerial::end()
         uartSetDebug(0);
     }
     uartEnd(_uart);
-    _uart = 0;
+    _uart = NULL;
 }
 
 size_t HardwareSerial::setRxBufferSize(size_t new_size) {
@@ -111,23 +117,17 @@ int HardwareSerial::availableForWrite(void)
 
 int HardwareSerial::peek(void)
 {
-    if (available()) {
-        return uartPeek(_uart);
-    }
-    return -1;
+    return uartPeek(_uart);
 }
 
 int HardwareSerial::read(void)
 {
-    if(available()) {
-        return uartRead(_uart);
-    }
-    return -1;
+    return uartRead(_uart);
 }
 
 void HardwareSerial::flush()
 {
-    uartFlush(_uart);
+    uartDrain(_uart);
 }
 
 size_t HardwareSerial::write(uint8_t c)
@@ -141,11 +141,12 @@ size_t HardwareSerial::write(const uint8_t *buffer, size_t size)
     uartWriteBuf(_uart, buffer, size);
     return size;
 }
-uint32_t  HardwareSerial::baudRate()
 
+uint32_t  HardwareSerial::baudRate()
 {
 	return uartGetBaudRate(_uart);
 }
+
 HardwareSerial::operator bool() const
 {
     return true;

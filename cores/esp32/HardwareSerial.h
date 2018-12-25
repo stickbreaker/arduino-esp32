@@ -94,6 +94,9 @@ public:
 protected:
     int _uart_nr;
     uart_t* _uart;
+    uint32_t _baud;
+    int _rx_pin;
+    int _tx_pin;
 };
 
 #if !defined(NO_GLOBAL_INSTANCES) && !defined(NO_GLOBAL_SERIAL)
