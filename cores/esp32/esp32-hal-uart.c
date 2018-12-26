@@ -360,7 +360,7 @@ uint32_t uartAvailable(uart_t* uart)
         return 0;
     }
     UART_MUTEX_LOCK();
-    uin32_t count = 0;
+    uint32_t count = 0;
     if(uart->queue){
         _uart_rx_read_fifo(uart);
         count = uxQueueMessagesWaiting(uart->queue);
