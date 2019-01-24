@@ -37,103 +37,99 @@ const uint32_t MHZ = 1000000;
 static apb_change_t * apb_change_callbacks = NULL;
 static xSemaphoreHandle apb_change_lock = NULL;
 
-static void initApbChangeCallback(){
+static bool initApbChangeCallback(){
     static volatile bool initialized = false;
     if(!initialized){
         initialized = true;
         apb_change_lock = xSemaphoreCreateMutex();
         if(!apb_change_lock){
             initialized = false;
+            log_e("apbChange init Fail");
         }
     }
+    return initialized;
 }
 
 static bool triggerApbChangeCallback(apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb){
-    initApbChangeCallback();
-    xSemaphoreTake(apb_change_lock, portMAX_DELAY);
-    apb_change_t * r = apb_change_callbacks;
-    bool success = true;
-    while((r != NULL)&& success){
-        success = r->cb(r->arg, ev_type, old_apb, new_apb);
-        if(ev_type == APB_AFTER_CHANGE){
+    if(initApbChangeCallback()){
+        xSemaphoreTake(apb_change_lock, portMAX_DELAY);
+        apb_change_t * r = apb_change_callbacks;
+        while(r != NULL){
+            r->cb(r->arg, ev_type, old_apb, new_apb);
             r = r->next;
-            success = true; // don't care after processor clock change
-        } else { //APB_BEFORE_CHANGE
-            if(success){
-                r = r->next;
-            } else { // unwind because a driver refused to accept the change
-                apb_change_t * r1 = apb_change_callbacks;
-                while( r1 != r ){ 
-                    r1->cb(r1->arg, APB_ABORT_CHANGE, old_apb, new_apb);
-                    r1 = r1->next;
-                }
-                break;
-            }
+            
         }
+        xSemaphoreGive(apb_change_lock);
+        return true;
+    } else {
+        return false;
     }
-    xSemaphoreGive(apb_change_lock);
-    return success;
 }
 
 bool addApbChangeCallback(void * arg, apb_change_cb_t cb){
-    initApbChangeCallback();
-    xSemaphoreTake(apb_change_lock, portMAX_DELAY);
-    apb_change_t * r = apb_change_callbacks;
-    
-    while(( r != NULL)&& !((r->arg == arg) && (r->cb == cb))) r=r->next;
-    if( r == NULL ){ // not already in list
-        r = (apb_change_t*)malloc(sizeof(apb_change_t));
-        if( r == NULL ){
-            log_e("Callback Object Malloc Failed");
-            xSemaphoreGive(apb_change_lock);
-            return false;
-        }
-        r->arg = arg;
-        r->cb = cb;
-        r->next = apb_change_callbacks; // add at front
-        apb_change_callbacks = r;
+    if(initApbChangeCallback()){
+        xSemaphoreTake(apb_change_lock, portMAX_DELAY);
+        apb_change_t * r = apb_change_callbacks;
         
+        while(( r != NULL)&& !((r->arg == arg) && (r->cb == cb))) r=r->next;
+        if( r == NULL ){ // not already in list
+            r = (apb_change_t*)malloc(sizeof(apb_change_t));
+            if( r == NULL ){
+                log_e("Callback Object Malloc Failed");
+                xSemaphoreGive(apb_change_lock);
+                return false;
+            }
+            r->arg = arg;
+            r->cb = cb;
+            r->next = apb_change_callbacks; // add at front
+            apb_change_callbacks = r;
+            
+        }
+        xSemaphoreGive(apb_change_lock);
+        return true;
     } else {
+        return false;
     }
-    xSemaphoreGive(apb_change_lock);
-    return true;
 }
 
 bool removeApbChangeCallback(void * arg, apb_change_cb_t cb){
-    initApbChangeCallback();
-    xSemaphoreTake(apb_change_lock, portMAX_DELAY);
-    apb_change_t * r = apb_change_callbacks, *r1=NULL;
-    if(r == NULL){
+    if(initApbChangeCallback()){  
+        xSemaphoreTake(apb_change_lock, portMAX_DELAY);
+        apb_change_t * r = apb_change_callbacks, *r1=NULL;
+        if(r == NULL){
+            xSemaphoreGive(apb_change_lock);
+            return false;
+        }
+        bool found = false;
+        bool done = false;
+        while( !found && !done ){
+            found = ((r->cb == cb)&&(r->arg == arg));
+            if(!found) {
+                r1 = r;
+                r = r->next;
+            }
+            done = r==NULL;
+        }
+        if(found){
+            if(r1 != NULL) {
+                r1->next = r->next;
+            } else {
+                apb_change_callbacks = r->next;
+                log_v("was head");
+            }
+            if(r->next == NULL) {
+                log_v("was tail");
+            }
+            free(r);
+        } else {
+            xSemaphoreGive(apb_change_lock);
+            return false; // did not exist
+        }
         xSemaphoreGive(apb_change_lock);
+        return true;
+    } else {
         return false;
     }
-    bool found = false;
-    bool done = false;
-    while( !found && !done ){
-        found = ((r->cb == cb)&&(r->arg == arg));
-        if(!found) {
-            r1 = r;
-            r = r->next;
-        }
-        done = r==NULL;
-    }
-    if(found){
-        if(r1 != NULL) {
-            r1->next = r->next;
-        } else {
-            apb_change_callbacks = r->next;
-            log_v("was head");
-        }
-        if(r->next == NULL) {
-            log_v("was tail");
-        }
-        free(r);
-    } else {
-        xSemaphoreGive(apb_change_lock);
-        return false; // did not exist
-    }
-    xSemaphoreGive(apb_change_lock);
-    return true;
 }
 
 static uint32_t calculateApb(rtc_cpu_freq_config_t * conf){
@@ -145,9 +141,13 @@ static uint32_t calculateApb(rtc_cpu_freq_config_t * conf){
 
 void esp_timer_impl_update_apb_freq(uint32_t apb_ticks_per_us); //private in IDF
 
-bool setCpuFrequency(uint32_t cpu_freq_mhz){
+bool setCpuFrequencyMhz(uint32_t cpu_freq_mhz){
     rtc_cpu_freq_config_t conf, cconf;
     uint32_t capb, apb;
+    if(cpu_freq_mhz < 10){
+        log_e("CPU Freq too Low %dMHz",cpu_freq_mhz);
+        return false;
+    }
     //Get current CPU clock configuration
     rtc_clk_cpu_freq_get_config(&cconf);
     //return if frequency has not changed
@@ -193,7 +193,7 @@ bool setCpuFrequency(uint32_t cpu_freq_mhz){
     return true;
 }
 
-uint32_t getCpuFrequencyMHz(){
+uint32_t getCpuFrequencyMhz(){
     rtc_cpu_freq_config_t conf;
     rtc_clk_cpu_freq_get_config(&conf);
     return conf.freq_mhz;

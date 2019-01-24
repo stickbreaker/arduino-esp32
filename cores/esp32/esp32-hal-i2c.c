@@ -448,23 +448,19 @@ static void IRAM_ATTR i2cTriggerDumps(i2c_t * i2c, uint8_t trigger, const char l
 /* Start of CPU Clock change Support
 */
 
-static bool i2cApbChangeCallback(void * arg, apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb){
+static void i2cApbChangeCallback(void * arg, apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb){
     i2c_t* i2c = (i2c_t*) arg; // recover data
     if(i2c == NULL) {  // point to peripheral control block does not exits
         return false;
     }
-    bool success = true;
     uint32_t oldFreq=0;
     switch(ev_type){
         case APB_BEFORE_CHANGE : 
             if(new_apb < 3000000) {// too slow
-                success=false;
+                log_e("apb speed %d too slow",new_apb);
                 break;
             }
             I2C_MUTEX_LOCK(); // lock will spin until current transaction is completed
-            break;
-        case APB_ABORT_CHANGE :
-            I2C_MUTEX_UNLOCK();
             break;
         case APB_AFTER_CHANGE :
             oldFreq = (i2c->dev->scl_low_period.period+i2c->dev->scl_high_period.period); //read old apbCycles 
@@ -479,7 +475,7 @@ static bool i2cApbChangeCallback(void * arg, apb_change_ev_t ev_type, uint32_t o
             log_e("unk ev %u",ev_type);
             I2C_MUTEX_UNLOCK();
     }
-    return success;
+    return;
 }
 /* End of CPU Clock change Support
 */ 
@@ -1688,8 +1684,8 @@ i2c_err_t i2cSetFrequency(i2c_t * i2c, uint32_t clk_speed)
     available when a Fifo interrupt is triggered.  This allows enough room in the Fifo so that
     interrupt latency does not cause a Fifo overflow/underflow event.
 */
-    log_v("cpu Freq=%dMhz, i2c Freq=%dHz",getCpuFrequencyMHz(),clk_speed);
-    uint32_t fifo_delta = (INTERRUPT_CYCLE_OVERHEAD/((getCpuFrequencyMHz()*1000000 / clk_speed)*10))+1; 
+    log_v("cpu Freq=%dMhz, i2c Freq=%dHz",getCpuFrequencyMhz(),clk_speed);
+    uint32_t fifo_delta = (INTERRUPT_CYCLE_OVERHEAD/((getCpuFrequencyMhz()*1000000 / clk_speed)*10))+1; 
     if (fifo_delta > 24) fifo_delta=24;   
     f.rx_fifo_full_thrhd = 32 - fifo_delta;
     f.tx_fifo_empty_thrhd = fifo_delta;

@@ -70,7 +70,7 @@ static uart_t _uart_bus_array[3] = {
 };
 #endif
 
-static bool uart_on_apb_change(void * arg, apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb);
+static void uart_on_apb_change(void * arg, apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb);
 
 static void _uart_rx_read_fifo( uart_t * uart){
     uint8_t c;
@@ -304,16 +304,15 @@ void uartEnd(uart_t* uart)
 
 }
 
-static bool uart_on_apb_change(void * arg, apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb)
+static void uart_on_apb_change(void * arg, apb_change_ev_t ev_type, uint32_t old_apb, uint32_t new_apb)
 {
     uart_t* uart = (uart_t*)arg;
-    bool success=true;
     int8_t saveRxPin;
     uint32_t clk_div,baud_rate;
     switch (ev_type){
         case APB_BEFORE_CHANGE:
             if(new_apb < 3000000) {
-                success=false;
+                log_e("apb too slow %d",new_apb);
                 break;
             }
             UART_MUTEX_LOCK();
@@ -321,10 +320,6 @@ static bool uart_on_apb_change(void * arg, apb_change_ev_t ev_type, uint32_t old
             uartDetachRx(uart); // release pin, disable interrupt
             uart->rx_pin =saveRxPin;
             uartDrain(uart);
-            break;
-        case APB_ABORT_CHANGE:
-            uartAttachRx(uart,uart->rx_pin,uart->invertedLogic);
-            UART_MUTEX_UNLOCK();
             break;
         case APB_AFTER_CHANGE:
         // set baudrate
@@ -339,7 +334,7 @@ static bool uart_on_apb_change(void * arg, apb_change_ev_t ev_type, uint32_t old
             break;
         default : ;
     }
-    return success;
+    return;
 }
 
 size_t uartResizeRxBuffer(uart_t * uart, size_t new_size) {
